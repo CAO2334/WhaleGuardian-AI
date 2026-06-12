@@ -55,3 +55,8 @@ artifacts/*
 # Local office documents that may contain personal or submission metadata
 *.doc
 *.docx
+
+# Local thesis writing aids and generated previews
+THESIS_*.md
+论文写作使用说明.md
+data_preview.png
