@@ -1,0 +1,57 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+ENV/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# IDE and editor metadata
+.idea/
+.vscode/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Raw datasets
+archive/
+!archive/.gitkeep
+archive/*.zip
+archive/*.tar
+archive/*.tar.gz
+archive/*.7z
+
+# Training outputs, reports, and logs
+outputs/
+logs/
+*.log
+whale_web/flask_stdout.log
+whale_web/flask_stderr.log
+
+# Model checkpoints and exported runtime artifacts
+*.pth
+*.pt
+*.ckpt
+*.onnx
+artifacts/*
+!artifacts/README.md
+
+# Temporary extracted documents and generated scratch files
+.codex_tmp_doc_extract/
+
+# Local office documents that may contain personal or submission metadata
+*.doc
+*.docx
