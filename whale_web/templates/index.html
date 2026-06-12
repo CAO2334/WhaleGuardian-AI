@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI护鲸使者 - 鲸类物种智能识别</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --ocean-900: #061826;
+      --ocean-800: #082235;
+      --ocean-700: #0d3a52;
+      --ocean-500: #0f8ca8;
+      --aqua-400: #2dd4bf;
+      --aqua-300: #67e8f9;
+      --text-main: #e8fbff;
+      --text-muted: #a9c7d0;
+      --line: rgba(103, 232, 249, 0.22);
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      color: var(--text-main);
+      background:
+        radial-gradient(circle at 10% 10%, rgba(45, 212, 191, 0.18), transparent 30%),
+        linear-gradient(135deg, var(--ocean-900), var(--ocean-800) 45%, #04111c);
+      font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    }
+
+    .app-shell {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 36px 18px 44px;
+    }
+
+    .brand-pill {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      padding: 7px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--aqua-300);
+      background: rgba(6, 24, 38, 0.68);
+      font-size: 14px;
+    }
+
+    .title {
+      margin-top: 18px;
+      font-size: clamp(32px, 5vw, 58px);
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      max-width: 760px;
+      color: var(--text-muted);
+      font-size: 17px;
+      line-height: 1.75;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(8, 34, 53, 0.72);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.32);
+      backdrop-filter: blur(14px);
+    }
+
+    .upload-zone {
+      min-height: 300px;
+      border: 2px dashed rgba(103, 232, 249, 0.42);
+      border-radius: 8px;
+      background: rgba(6, 24, 38, 0.48);
+      display: grid;
+      place-items: center;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .upload-zone:hover,
+    .upload-zone.dragover {
+      border-color: var(--aqua-300);
+      background: rgba(15, 140, 168, 0.16);
+      transform: translateY(-1px);
+    }
+
+    .upload-zone input {
+      display: none;
+    }
+
+    .preview-image {
+      width: 100%;
+      max-height: 360px;
+      object-fit: contain;
+      display: none;
+      background: #020b12;
+    }
+
+    .upload-copy {
+      padding: 28px;
+    }
+
+    .upload-icon {
+      width: 76px;
+      height: 76px;
+      margin: 0 auto 18px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--aqua-300);
+      font-size: 34px;
+      background: rgba(45, 212, 191, 0.08);
+    }
+
+    .btn-aqua {
+      border: 0;
+      border-radius: 8px;
+      color: #021017;
+      background: linear-gradient(90deg, var(--aqua-400), var(--aqua-300));
+      font-weight: 700;
+      padding: 12px 18px;
+    }
+
+    .btn-aqua:disabled {
+      opacity: 0.56;
+      cursor: not-allowed;
+    }
+
+    .result-value {
+      font-size: 34px;
+      font-weight: 800;
+      color: var(--aqua-300);
+      word-break: break-word;
+    }
+
+    .metric {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(6, 24, 38, 0.5);
+    }
+
+    .metric-label {
+      color: var(--text-muted);
+      font-size: 13px;
+      margin-bottom: 6px;
+    }
+
+    .chart-wrap {
+      min-height: 285px;
+    }
+
+    .status-line {
+      min-height: 24px;
+      color: var(--text-muted);
+    }
+
+    .spinner-border {
+      width: 1.25rem;
+      height: 1.25rem;
+    }
+
+    .alert-ocean {
+      border: 1px solid rgba(45, 212, 191, 0.24);
+      color: #d9fbff;
+      background: rgba(6, 24, 38, 0.76);
+      border-radius: 8px;
+    }
+
+    .uncertain-box {
+      border: 1px solid rgba(251, 191, 36, 0.42);
+      border-radius: 8px;
+      color: #fff7d6;
+      background: rgba(120, 73, 0, 0.22);
+    }
+  </style>
+</head>
+<body>
+  <main class="app-shell">
+    <section class="mb-4">
+      <div class="brand-pill">
+        <span>AI Whale Guardian</span>
+        <span>本地推理演示</span>
+      </div>
+      <h1 class="title">AI护鲸使者</h1>
+      <p class="subtitle">
+        上传一张海洋鲸类图片，本地 ResNet50-Transformer 模型会输出物种预测结果，并给出 Top-3 置信度分布。
+      </p>
+    </section>
+
+    {% if not model_ready %}
+      <div class="alert alert-ocean mb-4" role="alert">
+        后端尚未加载 ONNX 模型。请确认 <code>artifacts/final_model_04</code> 已存在，或已正确设置 <code>WHALE_ARTIFACT_DIR</code>，并已安装 <code>onnxruntime</code>。
+      </div>
+    {% endif %}
+
+    <section class="row g-4">
+      <div class="col-lg-6">
+        <div class="panel p-3 p-md-4 h-100">
+          <div id="uploadZone" class="upload-zone">
+            <input id="imageInput" type="file" accept=".png,.jpg,.jpeg,image/png,image/jpeg">
+            <img id="previewImage" class="preview-image" alt="上传图片预览">
+            <div id="uploadCopy" class="upload-copy">
+              <div class="upload-icon">≈</div>
+              <h2 class="h4 mb-2">拖拽图片到这里</h2>
+              <p class="mb-0 text-secondary-emphasis" style="color: var(--text-muted) !important;">
+                支持 JPG、JPEG、PNG，单张图片不超过 10MB；也可以点击选择本地图片。
+              </p>
+            </div>
+          </div>
+
+          <div class="d-grid gap-2 mt-3">
+            <button id="predictBtn" class="btn btn-aqua" disabled>开始识别</button>
+          </div>
+          <div id="statusLine" class="status-line mt-3"></div>
+        </div>
+      </div>
+
+      <div class="col-lg-6">
+        <div class="panel p-3 p-md-4 h-100">
+          <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+            <h2 class="h4 mb-0">识别结果</h2>
+            <span id="deviceBadge" class="badge text-bg-info d-none"></span>
+          </div>
+
+          <div id="emptyState" class="py-5 text-center" style="color: var(--text-muted);">
+            等待上传图片并开始识别。
+          </div>
+
+          <div id="loadingState" class="py-5 text-center d-none">
+            <div class="spinner-border text-info mb-3" role="status"></div>
+            <div>正在使用 AI 分析...</div>
+          </div>
+
+          <div id="resultState" class="d-none">
+            <div id="uncertainBox" class="uncertain-box p-3 mb-3 d-none">
+              <div class="fw-bold mb-1">需要人工复核</div>
+              <div id="uncertainMessage"></div>
+            </div>
+            <div class="metric mb-3">
+              <div class="metric-label">最可能物种</div>
+              <div id="speciesName" class="result-value">-</div>
+            </div>
+            <div class="metric mb-4">
+              <div class="metric-label">置信度</div>
+              <div id="confidenceValue" class="result-value">-</div>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="topChart"></canvas>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const uploadZone = document.getElementById("uploadZone");
+    const imageInput = document.getElementById("imageInput");
+    const previewImage = document.getElementById("previewImage");
+    const uploadCopy = document.getElementById("uploadCopy");
+    const predictBtn = document.getElementById("predictBtn");
+    const statusLine = document.getElementById("statusLine");
+    const emptyState = document.getElementById("emptyState");
+    const loadingState = document.getElementById("loadingState");
+    const resultState = document.getElementById("resultState");
+    const speciesName = document.getElementById("speciesName");
+    const confidenceValue = document.getElementById("confidenceValue");
+    const uncertainBox = document.getElementById("uncertainBox");
+    const uncertainMessage = document.getElementById("uncertainMessage");
+    const deviceBadge = document.getElementById("deviceBadge");
+    const chartCanvas = document.getElementById("topChart");
+
+    let selectedFile = null;
+    let topChart = null;
+
+    uploadZone.addEventListener("click", () => imageInput.click());
+    imageInput.addEventListener("change", (event) => {
+      const file = event.target.files[0];
+      if (file) {
+        setSelectedFile(file);
+      }
+    });
+
+    ["dragenter", "dragover"].forEach((eventName) => {
+      uploadZone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        uploadZone.classList.add("dragover");
+      });
+    });
+
+    ["dragleave", "drop"].forEach((eventName) => {
+      uploadZone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        uploadZone.classList.remove("dragover");
+      });
+    });
+
+    uploadZone.addEventListener("drop", (event) => {
+      const file = event.dataTransfer.files[0];
+      if (file) {
+        setSelectedFile(file);
+      }
+    });
+
+    predictBtn.addEventListener("click", async () => {
+      if (!selectedFile) {
+        setStatus("请先选择一张图片。", true);
+        return;
+      }
+
+      const formData = new FormData();
+      // 后端 /predict 固定读取 FormData 中名为 image 的文件字段。
+      formData.append("image", selectedFile);
+
+      setLoading(true);
+      setStatus("");
+
+      try {
+        const response = await fetch("/predict", {
+          method: "POST",
+          body: formData,
+        });
+
+        const payload = await response.json();
+        if (!response.ok || payload.code !== 200) {
+          throw new Error(payload.msg || "识别请求失败。");
+        }
+
+        renderResult(payload.data);
+        setStatus("识别完成。");
+      } catch (error) {
+        showError(error.message);
+      } finally {
+        setLoading(false);
+      }
+    });
+
+    function setSelectedFile(file) {
+      if (!file.type.startsWith("image/")) {
+        setStatus("请选择图片文件。", true);
+        return;
+      }
+
+      selectedFile = file;
+      predictBtn.disabled = false;
+      setStatus(`已选择：${file.name}`);
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        previewImage.src = event.target.result;
+        previewImage.style.display = "block";
+        uploadCopy.style.display = "none";
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function setLoading(isLoading) {
+      predictBtn.disabled = isLoading || !selectedFile;
+      loadingState.classList.toggle("d-none", !isLoading);
+      if (isLoading) {
+        emptyState.classList.add("d-none");
+        resultState.classList.add("d-none");
+      }
+    }
+
+    function renderResult(data) {
+      emptyState.classList.add("d-none");
+      loadingState.classList.add("d-none");
+      resultState.classList.remove("d-none");
+
+      speciesName.textContent = data.species_display || data.species;
+      confidenceValue.textContent = `${Number(data.confidence_percent).toFixed(2)}%`;
+
+      if (data.is_uncertain) {
+        uncertainBox.classList.remove("d-none");
+        uncertainMessage.textContent = `${data.message} 当前阈值：${Number(data.confidence_threshold_percent).toFixed(2)}%。`;
+      } else {
+        uncertainBox.classList.add("d-none");
+        uncertainMessage.textContent = "";
+      }
+
+      if (data.providers && data.providers.length > 0) {
+        deviceBadge.textContent = data.providers.join(" / ");
+        deviceBadge.classList.remove("d-none");
+      }
+
+      // Top-3 数据结构来自后端:
+      // [{ species_display: "Humpback Whale", confidence_percent: 83.21 }, ...]
+      const labels = data.top3.map((item) => item.species_display || item.species);
+      const values = data.top3.map((item) => item.confidence_percent);
+
+      if (topChart) {
+        topChart.destroy();
+      }
+
+      topChart = new Chart(chartCanvas, {
+        type: "bar",
+        data: {
+          labels,
+          datasets: [{
+            label: "Top-3 置信度",
+            data: values,
+            borderWidth: 1,
+            borderColor: "rgba(103, 232, 249, 0.88)",
+            backgroundColor: [
+              "rgba(45, 212, 191, 0.82)",
+              "rgba(103, 232, 249, 0.58)",
+              "rgba(15, 140, 168, 0.58)"
+            ],
+            borderRadius: 6
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: {
+            duration: 650,
+            easing: "easeOutQuart"
+          },
+          plugins: {
+            legend: {
+              labels: { color: "#e8fbff" }
+            },
+            tooltip: {
+              callbacks: {
+                label: (context) => `${context.parsed.y.toFixed(2)}%`
+              }
+            }
+          },
+          scales: {
+            x: {
+              ticks: { color: "#a9c7d0" },
+              grid: { color: "rgba(103, 232, 249, 0.08)" }
+            },
+            y: {
+              beginAtZero: true,
+              max: 100,
+              ticks: {
+                color: "#a9c7d0",
+                callback: (value) => `${value}%`
+              },
+              grid: { color: "rgba(103, 232, 249, 0.12)" }
+            }
+          }
+        }
+      });
+    }
+
+    function showError(message) {
+      emptyState.classList.remove("d-none");
+      resultState.classList.add("d-none");
+      setStatus(message, true);
+    }
+
+    function setStatus(message, isError = false) {
+      statusLine.textContent = message;
+      statusLine.style.color = isError ? "#ffb4b4" : "var(--text-muted)";
+    }
+  </script>
+</body>
+</html>
