@@ -22,11 +22,15 @@ python tools/export_onnx.py `
   --version v1
 ```
 
-Flask 默认优先加载:
+Flask 默认优先加载当前最佳单模型 07:
 
 ```text
-artifacts/whale_resnet50_transformer_v1
+artifacts/final_model_07
 ```
+
+如果该目录不存在，Flask 会自动搜索项目根目录或 `outputs/` 下最新的
+`autodl_research_*/artifact`，并只接受 `experiment_name` 为
+`07_previous_best_transformer_recipe` 的 artifact。
 
 也可以通过环境变量切换模型版本:
 

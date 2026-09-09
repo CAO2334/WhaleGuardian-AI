@@ -132,6 +132,7 @@ class WhaleONNXPredictor:
         return {
             "model_name": self.model_name,
             "version": self.version,
+            "experiment_name": self.config.get("experiment_name", self.metrics.get("experiment_name", "")),
             "artifact_dir": str(self.artifact_dir) if self.artifact_dir is not None else "",
             "onnx_model_path": str(self.onnx_path),
             "class_map_path": str(self.class_map_path),

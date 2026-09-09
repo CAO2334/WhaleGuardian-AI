@@ -12,6 +12,7 @@ AI护鲸使者 Web 演示系统 - Flask + ONNX Runtime
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 from pathlib import Path
@@ -43,7 +44,54 @@ def resolve_project_path(path_value: str | Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-DEFAULT_ARTIFACT_DIR = PROJECT_ROOT / "artifacts" / "final_model_04"
+BEST_SINGLE_EXPERIMENT = "07_previous_best_transformer_recipe"
+
+
+def _is_best_single_artifact(path: Path) -> bool:
+    """检查目录是否包含当前最佳单模型 07 的完整 ONNX artifact。"""
+    required = ("model.onnx", "class_to_idx.json", "config.json", "manifest.json")
+    if not path.is_dir() or any(not (path / name).is_file() for name in required):
+        return False
+    try:
+        with open(path / "config.json", "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        with open(path / "metrics.json", "r", encoding="utf-8") as handle:
+            metrics = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return False
+    experiment_name = config.get("experiment_name") or metrics.get("experiment_name")
+    return experiment_name == BEST_SINGLE_EXPERIMENT
+
+
+def resolve_default_artifact_dir() -> Path:
+    """
+    自动寻找当前最佳单模型 artifact。
+
+    优先使用规范目录 ``artifacts/final_model_07``；如果用户直接运行了
+    AutoDL 研究流水线，则继续搜索项目根目录和 outputs 下最新的
+    ``autodl_research_*/artifact``。找不到时返回规范目录，让健康检查给出
+    明确的缺失路径提示；环境变量 WHALE_ARTIFACT_DIR 仍可覆盖该默认值。
+    """
+    canonical = PROJECT_ROOT / "artifacts" / "final_model_07"
+    candidates = [canonical]
+    for search_root in (PROJECT_ROOT, PROJECT_ROOT / "outputs"):
+        try:
+            run_dirs = sorted(
+                search_root.glob("autodl_research_*/artifact"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            run_dirs = []
+        candidates.extend(run_dirs)
+
+    for candidate in candidates:
+        if _is_best_single_artifact(candidate):
+            return candidate
+    return canonical
+
+
+DEFAULT_ARTIFACT_DIR = resolve_default_artifact_dir()
 ARTIFACT_DIR = resolve_project_path(os.getenv("WHALE_ARTIFACT_DIR", DEFAULT_ARTIFACT_DIR))
 USE_ARTIFACT = os.getenv("WHALE_USE_ARTIFACT", "1") != "0"
 ONNX_MODEL_PATH = resolve_project_path(os.getenv("WHALE_ONNX_PATH", PROJECT_ROOT / "whale_model.onnx"))
@@ -232,6 +280,7 @@ def health():
         "use_artifact": USE_ARTIFACT,
         "model_name": model_info.get("model_name", ""),
         "version": model_info.get("version", ""),
+        "experiment_name": model_info.get("experiment_name", ""),
         "num_classes": model_info.get("num_classes", 0),
         "onnx_model_path": str(ONNX_MODEL_PATH),
         "class_map_path": str(CLASS_MAP_PATH),
@@ -290,6 +339,7 @@ def predict():
         "model": {
             "model_name": model_info.get("model_name", ""),
             "version": model_info.get("version", ""),
+            "experiment_name": model_info.get("experiment_name", ""),
             "artifact_dir": model_info.get("artifact_dir", ""),
         },
     }

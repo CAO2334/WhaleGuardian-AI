@@ -416,27 +416,32 @@ Grad-CAM 用于观察 CNN 局部关注区域，Transformer Attention Map 用于�
 
 ## ONNX 导出与模型版本管理
 
-当前推荐的最终模型 artifact 为：
+当前推荐的最佳单模型 artifact 为：
 
 ```text
-artifacts/final_model_04
+artifacts/final_model_07
 ```
+
+Flask 启动时会优先加载该目录；如果目录不存在，会自动搜索项目根目录或
+`outputs/autodl_research_*/artifact` 中 `experiment_name` 为
+`07_previous_best_transformer_recipe` 的最新 artifact。也可以通过
+`WHALE_ARTIFACT_DIR` 显式指定路径。
 
 如果需要重新导出或覆盖该 artifact，可执行：
 
 ```powershell
 python tools/export_onnx.py `
-  --checkpoint outputs/reports/final_model_04/best_model.pth `
-  --class-map outputs/reports/final_model_04/class_to_idx.json `
-  --metrics outputs/reports/final_model_04/metrics.json `
-  --artifact-dir artifacts/final_model_04 `
-  --version v_final_04
+  --checkpoint outputs/reports/final_model_07/best_model.pth `
+  --class-map outputs/reports/final_model_07/class_to_idx.json `
+  --metrics outputs/reports/final_model_07/metrics.json `
+  --artifact-dir artifacts/final_model_07 `
+  --version v_final_07
 ```
 
 生成：
 
 ```text
-artifacts/final_model_04/
+artifacts/final_model_07/
   model.onnx
   class_to_idx.json
   config.json
@@ -449,7 +454,7 @@ artifacts/final_model_04/
 
 ```powershell
 python deploy/onnx_inference.py `
-  --artifact-dir artifacts/final_model_04 `
+  --artifact-dir artifacts/final_model_07 `
   --image archive/train_images/xxx.jpg `
   --confidence-threshold 0.5
 ```
@@ -457,7 +462,7 @@ python deploy/onnx_inference.py `
 已验证样例：
 
 ```powershell
-python deploy/onnx_inference.py --artifact-dir artifacts/final_model_04 --image archive/train_images/90f1655bca651f.jpg --confidence-threshold 0.5
+python deploy/onnx_inference.py --artifact-dir artifacts/final_model_07 --image archive/train_images/90f1655bca651f.jpg --confidence-threshold 0.5
 ```
 
 输出摘要：
@@ -496,7 +501,7 @@ http://127.0.0.1:5000/health
 默认加载：
 
 ```text
-artifacts/final_model_04
+artifacts/final_model_07（或自动发现的 AutoDL 07 artifact）
 ```
 
 切换模型版本：
