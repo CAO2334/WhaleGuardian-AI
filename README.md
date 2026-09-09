@@ -282,6 +282,20 @@ RUN_ROOT=outputs/autodl_remaining_20260909-023128 \
 
 脚本固定训练种子 `42`，自动跳过已完成实验，并生成 `reports/ablation/report.md` 与 `macro_f1.png`。完成后使用验证 Macro F1 最高的 checkpoint；不要用独立测试集反复挑选。
 
+候选清单：
+
+| 编号 | 单变量改动 |
+|---|---|
+| 08 | Focal → CE，保留 Mixup/Cutout |
+| 09 | 关闭 Mixup |
+| 10 | 关闭 Cutout |
+| 11 | 裁剪最小尺度 0.8 |
+| 12/13 | Token Pool 8/24 |
+| 14 | Transformer 只使用 layer3 |
+| 15 | Dropout 0.2 |
+| 16 | 前 2 个 epoch 冻结主干 |
+| 17 | 输入尺寸 384 |
+
 已经完成受控消融时，不需要重新训练。可复用 02/04/06/07 检查点，在固定验证集上锁定概率集成与水平翻转 TTA，再只评估一次独立测试集：
 
 ```bash
