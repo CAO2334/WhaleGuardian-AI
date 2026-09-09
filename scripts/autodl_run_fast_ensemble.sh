@@ -14,6 +14,7 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 WEIGHT_STEP="${WEIGHT_STEP:-0.1}"
 SEED="${SEED:-42}"
+EXPORT_ENSEMBLE_ARTIFACTS="${EXPORT_ENSEMBLE_ARTIFACTS:-1}"
 
 if [[ -z "${RUN_ROOT}" ]]; then
   echo "Usage: RUN_ROOT=outputs/autodl_research_YYYYMMDD-HHMMSS bash scripts/autodl_run_fast_ensemble.sh"
@@ -31,5 +32,12 @@ python tools/evaluate_fast_ensemble.py \
   --num-workers "${NUM_WORKERS}" \
   --weight-step "${WEIGHT_STEP}" \
   --seed "${SEED}"
+
+if [[ "${EXPORT_ENSEMBLE_ARTIFACTS}" == "1" ]]; then
+  python tools/export_ensemble_artifacts.py \
+    --run-root "${RUN_ROOT}" \
+    --output-dir "${RUN_ROOT}/ensemble_artifacts" \
+    --seed "${SEED}"
+fi
 
 echo "Done: ${RUN_ROOT}/reports/fast_ensemble/report.md"

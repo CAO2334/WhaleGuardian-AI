@@ -12,7 +12,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +30,12 @@ class AblationExperiment:
     transformer_pooling: str = "mean"
     metric_pooling: str = "gem"
     metric_head: str = "linear"
+    image_size: Optional[int] = None
+    token_pool_size: Optional[int] = None
+    backbone_stage: Optional[str] = None
+    dropout: Optional[float] = None
+    focal_gamma: Optional[float] = None
+    freeze_backbone_epochs: Optional[int] = None
 
 
 CONTROLLED_EXPERIMENTS = [
@@ -100,12 +106,107 @@ LEGACY_EXPERIMENTS = [
 ]
 
 
+# Follow-up experiments after the completed 01-07 suite.  They keep the
+# 07 recipe fixed and change one high-value factor at a time; the seed remains
+# the single user-approved seed 42.  These are candidates, not a guarantee of
+# improvement, and are selected by validation Macro F1 only.
+REMAINING_EXPERIMENTS = [
+    AblationExperiment(
+        "08_transformer_ce_mixup_cutout",
+        "transformer",
+        loss_type="ce",
+        mixup_alpha=0.4,
+        cutout_p=0.5,
+        transformer_pooling="mean",
+    ),
+    AblationExperiment(
+        "09_transformer_focal_nomixup_cutout",
+        "transformer",
+        loss_type="focal",
+        mixup_alpha=0.0,
+        cutout_p=0.5,
+        transformer_pooling="mean",
+    ),
+    AblationExperiment(
+        "10_transformer_focal_mixup_nocutout",
+        "transformer",
+        loss_type="focal",
+        mixup_alpha=0.4,
+        cutout_p=0.0,
+        transformer_pooling="mean",
+    ),
+    AblationExperiment(
+        "11_transformer_focal_mixup_cutout_crop",
+        "transformer",
+        loss_type="focal",
+        mixup_alpha=0.4,
+        cutout_p=0.5,
+        crop_scale_min=0.8,
+        transformer_pooling="mean",
+    ),
+    AblationExperiment(
+        "12_transformer_focal_mixup_cutout_token8",
+        "transformer",
+        loss_type="focal",
+        mixup_alpha=0.4,
+        cutout_p=0.5,
+        transformer_pooling="mean",
+        token_pool_size=8,
+    ),
+    AblationExperiment(
+        "13_transformer_focal_mixup_cutout_token24",
+        "transformer",
+        loss_type="focal",
+        mixup_alpha=0.4,
+        cutout_p=0.5,
+        transformer_pooling="mean",
+        token_pool_size=24,
+    ),
+    AblationExperiment(
+        "14_transformer_focal_mixup_cutout_layer3",
+        "transformer",
+        loss_type="focal",
+        mixup_alpha=0.4,
+        cutout_p=0.5,
+        transformer_pooling="mean",
+        backbone_stage="layer3",
+    ),
+    AblationExperiment(
+        "15_transformer_focal_mixup_cutout_dropout02",
+        "transformer",
+        loss_type="focal",
+        mixup_alpha=0.4,
+        cutout_p=0.5,
+        transformer_pooling="mean",
+        dropout=0.2,
+    ),
+    AblationExperiment(
+        "16_transformer_focal_mixup_cutout_freeze2",
+        "transformer",
+        loss_type="focal",
+        mixup_alpha=0.4,
+        cutout_p=0.5,
+        transformer_pooling="mean",
+        freeze_backbone_epochs=2,
+    ),
+    AblationExperiment(
+        "17_transformer_focal_mixup_cutout_image384",
+        "transformer",
+        loss_type="focal",
+        mixup_alpha=0.4,
+        cutout_p=0.5,
+        transformer_pooling="mean",
+        image_size=384,
+    ),
+]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="运行鲸类物种分类受控消融实验")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--run", action="store_true", help="真正开始训练")
     mode.add_argument("--dry-run", action="store_true", help="只打印命令")
-    parser.add_argument("--suite", choices=("controlled", "legacy"), default="controlled")
+    parser.add_argument("--suite", choices=("controlled", "legacy", "remaining"), default="controlled")
     parser.add_argument("--data-root", default="archive")
     parser.add_argument("--output-root", default="outputs/ablations")
     parser.add_argument("--epochs", type=int, default=20)
@@ -137,7 +238,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def get_suite(name: str) -> List[AblationExperiment]:
-    return CONTROLLED_EXPERIMENTS if name == "controlled" else LEGACY_EXPERIMENTS
+    if name == "controlled":
+        return CONTROLLED_EXPERIMENTS
+    if name == "legacy":
+        return LEGACY_EXPERIMENTS
+    return REMAINING_EXPERIMENTS
 
 
 def build_command(args: argparse.Namespace, exp: AblationExperiment, seed: int) -> List[str]:
@@ -152,7 +257,7 @@ def build_command(args: argparse.Namespace, exp: AblationExperiment, seed: int) 
         "--experiment-name", exp.name,
         "--epochs", str(args.epochs),
         "--batch-size", str(args.batch_size),
-        "--image-size", str(args.image_size),
+        "--image-size", str(exp.image_size if exp.image_size is not None else args.image_size),
         "--num-workers", str(args.num_workers),
         "--val-ratio", str(args.val_ratio),
         "--test-ratio", str(args.test_ratio),
@@ -168,11 +273,19 @@ def build_command(args: argparse.Namespace, exp: AblationExperiment, seed: int) 
     ]
 
     if exp.model_type == "transformer":
+        backbone_stage = exp.backbone_stage if exp.backbone_stage is not None else args.backbone_stage
+        token_pool_size = exp.token_pool_size if exp.token_pool_size is not None else args.token_pool_size
         command.extend([
-            "--backbone-stage", args.backbone_stage,
+            "--backbone-stage", backbone_stage,
             "--transformer-pooling", exp.transformer_pooling,
-            "--token-pool-size", str(args.token_pool_size),
+            "--token-pool-size", str(token_pool_size),
         ])
+        if exp.dropout is not None:
+            command.extend(["--dropout", str(exp.dropout)])
+        if exp.focal_gamma is not None:
+            command.extend(["--focal-gamma", str(exp.focal_gamma)])
+        if exp.freeze_backbone_epochs is not None:
+            command.extend(["--freeze-backbone-epochs", str(exp.freeze_backbone_epochs)])
     if exp.model_type == "metric":
         command.extend([
             "--metric-pooling", exp.metric_pooling,

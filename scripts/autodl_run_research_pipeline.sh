@@ -31,6 +31,7 @@ KEEP_ALL_CHECKPOINTS_IN_PACKAGE="${KEEP_ALL_CHECKPOINTS_IN_PACKAGE:-0}"
 AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-0}"
 SHUTDOWN_ON_FAILURE="${SHUTDOWN_ON_FAILURE:-0}"
 SHUTDOWN_CMD="${SHUTDOWN_CMD:-/usr/bin/shutdown}"
+EXPORT_ENSEMBLE_ARTIFACTS="${EXPORT_ENSEMBLE_ARTIFACTS:-1}"
 
 RUN_ROOT="${RUN_ROOT:-outputs/autodl_research_${RUN_TS}}"
 ABLATION_ROOT="${RUN_ROOT}/ablations"
@@ -214,6 +215,13 @@ python tools/export_onnx.py \
   --metrics "${REPORT_ROOT}/final_test/metrics.json" \
   --artifact-dir "${ARTIFACT_DIR}" \
   --version "${RUN_TS}"
+
+if [[ "${EXPORT_ENSEMBLE_ARTIFACTS}" == "1" ]]; then
+  python tools/export_ensemble_artifacts.py \
+    --run-root "${RUN_ROOT}" \
+    --output-dir "${RUN_ROOT}/ensemble_artifacts" \
+    --seed "${SPLIT_SEED}"
+fi
 
 cp "${CHECKPOINT}" "${FINAL_MODEL_DIR}/best_model.pth"
 cp "${CLASS_MAP}" "${FINAL_MODEL_DIR}/class_to_idx.json"

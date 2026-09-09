@@ -16,7 +16,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 from flask import Flask, jsonify, render_template, request
 from PIL import Image, UnidentifiedImageError
@@ -28,6 +28,7 @@ PROJECT_ROOT = BASE_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from deploy.ensemble_inference import WhaleEnsemblePredictor
 from deploy.onnx_inference import WhaleONNXPredictor
 
 
@@ -91,9 +92,39 @@ def resolve_default_artifact_dir() -> Path:
     return canonical
 
 
+def _is_ensemble_artifact(path: Path) -> bool:
+    """判断集成目录是否至少包含 manifest，组件完整性由 predictor 校验。"""
+    return path.is_dir() and (path / "ensemble_manifest.json").is_file()
+
+
+def resolve_default_ensemble_artifact_dir() -> Path:
+    """优先寻找规范集成目录，其次寻找 AutoDL 运行目录生成的集成目录。"""
+    canonical = PROJECT_ROOT / "artifacts" / "final_ensemble_07"
+    candidates = [canonical]
+    for search_root in (PROJECT_ROOT, PROJECT_ROOT / "outputs"):
+        try:
+            candidates.extend(
+                sorted(
+                    search_root.glob("autodl_research_*/ensemble_artifacts"),
+                    key=lambda item: item.stat().st_mtime,
+                    reverse=True,
+                )
+            )
+        except OSError:
+            continue
+    for candidate in candidates:
+        if _is_ensemble_artifact(candidate):
+            return candidate
+    return canonical
+
+
 DEFAULT_ARTIFACT_DIR = resolve_default_artifact_dir()
 ARTIFACT_DIR = resolve_project_path(os.getenv("WHALE_ARTIFACT_DIR", DEFAULT_ARTIFACT_DIR))
 USE_ARTIFACT = os.getenv("WHALE_USE_ARTIFACT", "1") != "0"
+USE_ENSEMBLE = os.getenv("WHALE_USE_ENSEMBLE", "1") != "0"
+ENSEMBLE_ARTIFACT_DIR = resolve_project_path(
+    os.getenv("WHALE_ENSEMBLE_ARTIFACT_DIR", resolve_default_ensemble_artifact_dir())
+)
 ONNX_MODEL_PATH = resolve_project_path(os.getenv("WHALE_ONNX_PATH", PROJECT_ROOT / "whale_model.onnx"))
 CLASS_MAP_PATH = resolve_project_path(os.getenv("WHALE_CLASS_MAP_PATH", PROJECT_ROOT / "outputs" / "class_to_idx.json"))
 IMAGE_SIZE = int(os.getenv("WHALE_IMAGE_SIZE", "512"))
@@ -105,16 +136,27 @@ ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
 
-predictor: Optional[WhaleONNXPredictor] = None
+Predictor = Union[WhaleONNXPredictor, WhaleEnsemblePredictor]
+predictor: Optional[Predictor] = None
 predictor_error = ""
 
 
-def create_predictor() -> Tuple[Optional[WhaleONNXPredictor], str]:
+def create_predictor() -> Tuple[Optional[Predictor], str]:
     """
     服务启动时尝试加载 ONNX 模型。
     如果模型文件或 onnxruntime 暂时不存在，Flask 仍然启动，便于前端展示健康状态。
     """
     errors = []
+    if USE_ENSEMBLE:
+        try:
+            model = WhaleEnsemblePredictor(
+                artifact_dir=ENSEMBLE_ARTIFACT_DIR,
+                confidence_threshold=CONFIDENCE_THRESHOLD,
+            )
+            return model, f"四模型集成加载成功: {ENSEMBLE_ARTIFACT_DIR}"
+        except Exception as exc:
+            errors.append(f"集成 artifact 加载失败: {exc}")
+
     if USE_ARTIFACT:
         try:
             model = WhaleONNXPredictor(
@@ -278,9 +320,14 @@ def health():
         "onnx_runtime": predictor is not None,
         "artifact_dir": str(ARTIFACT_DIR),
         "use_artifact": USE_ARTIFACT,
+        "ensemble_artifact_dir": str(ENSEMBLE_ARTIFACT_DIR),
+        "use_ensemble": USE_ENSEMBLE,
         "model_name": model_info.get("model_name", ""),
         "version": model_info.get("version", ""),
         "experiment_name": model_info.get("experiment_name", ""),
+        "model_count": model_info.get("model_count", 1 if predictor is not None else 0),
+        "weights": model_info.get("weights", {}),
+        "components": model_info.get("components", []),
         "num_classes": model_info.get("num_classes", 0),
         "onnx_model_path": str(ONNX_MODEL_PATH),
         "class_map_path": str(CLASS_MAP_PATH),
@@ -340,6 +387,8 @@ def predict():
             "model_name": model_info.get("model_name", ""),
             "version": model_info.get("version", ""),
             "experiment_name": model_info.get("experiment_name", ""),
+            "model_count": model_info.get("model_count", 1),
+            "weights": model_info.get("weights", {}),
             "artifact_dir": model_info.get("artifact_dir", ""),
         },
     }
