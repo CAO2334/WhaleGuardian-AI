@@ -44,10 +44,8 @@ AI鲸鱼/
     generate_gradcam.py            # 生成 CNN Grad-CAM 可解释性热力图
     generate_attention_map.py      # 生成 Transformer Attention Map 可解释性热力图
     export_onnx.py                 # 导出 ONNX，并打包 artifact 模型版本目录
-    export_ensemble_artifacts.py   # 导出四模型概率集成组件和 manifest
   deploy/                          # 推理部署代码
     onnx_inference.py              # ONNX Runtime 推理类，含图片预处理、Top-3 输出、低置信度判断
-    ensemble_inference.py          # 多 ONNX 组件 soft-voting 集成推理类
   whale_web/                       # Flask 本地 Web 推理服务
     app.py                         # Flask API 服务，负责图片上传校验、模型调用、REST 响应
     templates/index.html           # 单页前端界面，含拖拽上传、预览、Top-3 图表和不确定提示
@@ -265,36 +263,6 @@ AutoDL 脚本安装 `requirements-autodl.txt`，不会覆盖镜像中与 CUDA �
 SEEDS="42 123 3407" EPOCHS=20 BATCH_SIZE=8 NUM_WORKERS=8 \
   bash scripts/autodl_run_research_pipeline.sh
 ```
-
-如果只保留当前已完成的 seed 42，还可以运行后续十个高价值单变量候选实验。它们用于检验损失函数、Mixup/Cutout、裁剪强度、Token 分辨率、骨干层级、Dropout、冻结策略和输入尺寸；它们不能数学上保证找到“全局最佳”，最终仍需按验证集 Macro F1 选择一个方案，再对该方案做一次独立测试。
-
-```bash
-bash scripts/autodl_run_remaining_ablations.sh
-```
-
-续跑或只跑指定候选：
-
-```bash
-RUN_ROOT=outputs/autodl_remaining_20260909-023128 \
-  ONLY="08_transformer_ce_mixup_cutout 12_transformer_focal_mixup_cutout_token8" \
-  bash scripts/autodl_run_remaining_ablations.sh
-```
-
-脚本固定训练种子 `42`，自动跳过已完成实验，并生成 `reports/ablation/report.md` 与 `macro_f1.png`。完成后使用验证 Macro F1 最高的 checkpoint；不要用独立测试集反复挑选。
-
-候选清单：
-
-| 编号 | 单变量改动 |
-|---|---|
-| 08 | Focal → CE，保留 Mixup/Cutout |
-| 09 | 关闭 Mixup |
-| 10 | 关闭 Cutout |
-| 11 | 裁剪最小尺度 0.8 |
-| 12/13 | Token Pool 8/24 |
-| 14 | Transformer 只使用 layer3 |
-| 15 | Dropout 0.2 |
-| 16 | 前 2 个 epoch 冻结主干 |
-| 17 | 输入尺寸 384 |
 
 已经完成受控消融时，不需要重新训练。可复用 02/04/06/07 检查点，在固定验证集上锁定概率集成与水平翻转 TTA，再只评估一次独立测试集：
 
@@ -559,23 +527,6 @@ Web 端已包含：
 - Top-3 置信度柱状图
 - 低置信度“不确定，建议人工复核”提示
 
-启用四模型概率集成：
-
-```powershell
-$env:WHALE_USE_ENSEMBLE="1"
-$env:WHALE_ENSEMBLE_ARTIFACT_DIR="outputs/autodl_research_20260909-023128/ensemble_artifacts"
-python whale_web/app.py
-```
-
-集成 artifact 可由已完成的四个 checkpoint 导出：
-
-```bash
-python tools/export_ensemble_artifacts.py \
-  --run-root outputs/autodl_research_20260909-023128
-```
-
-默认权重为 `02/04/06/07 = 0.1/0.1/0.1/0.7`，由验证集 Macro F1 锁定。集成目录缺失或组件不完整时，服务自动回退到最佳单模型 07。
-
 ## Docker 部署
 
 构建镜像：
@@ -609,7 +560,7 @@ docker run --rm -p 5000:5000 `
 
 集成候选为 02 ResNet50、04 ResNet50 + GeM、06 ResNet50-Transformer CE 和 07 最佳单模型。权重以验证 Macro F1 搜索，最终锁定为 `0.1 / 0.1 / 0.1 / 0.7`，水平翻转 TTA 未被选中。相对 07 单模型，独立测试错误数由 133 降至 84，Accuracy 提升 0.92 个百分点，Macro F1 提升 1.61 个百分点。
 
-集成用于研究结果；当四个 ONNX 组件被导出到 `ensemble_artifacts/` 后，Flask 默认优先加载集成，目录缺失时自动回退到 07 单模型。集成会增加约四倍模型存储和推理计算；若更看重低延迟，可设置 `WHALE_USE_ENSEMBLE=0` 使用单模型。旧划分上的历史最佳验证 Macro F1 为 91.99%，不能与当前独立测试结果直接比较。
+集成用于研究结果；ONNX/Flask 部署仍使用 07 单模型，以控制模型体积和推理成本。旧划分上的历史最佳验证 Macro F1 为 91.99%，不能与当前独立测试结果直接比较。
 
 完整消融表和实验边界见 [reports/ablation_final_20260909-023128.md](reports/ablation_final_20260909-023128.md)。
 
@@ -623,7 +574,7 @@ docker run --rm -p 5000:5000 `
 - 使用 Macro F1 作为核心保存指标，避免 Accuracy 被高频类别主导。
 - 使用 Group Split by `individual_id` 防止同一鲸鱼个体泄漏到验证集。
 - 提供完整消融实验、长尾分析、混淆矩阵、Grad-CAM 和 Attention Map。
-- 复用四个互补检查点做验证集锁定的概率集成，在不重新训练的情况下把独立测试 Macro F1 从 90.99% 提升到 92.60%；四个模型不能简单平均权重拼成一个更小的网络，若需要单文件/低延迟版本应另做知识蒸馏并重新评估。
+- 复用四个互补检查点做验证集锁定的概率集成，在不重新训练的情况下把独立测试 Macro F1 从 90.99% 提升到 92.60%。
 - 支持 ONNX Runtime、模型 artifact 版本管理、Flask Web 推理服务和 Docker 部署。
 - Web 服务包含文件校验、全局异常处理和低置信度不确定样本提示。
 
