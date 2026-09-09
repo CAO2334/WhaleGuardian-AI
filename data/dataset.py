@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import random
 from pathlib import Path
@@ -224,6 +225,60 @@ def split_train_val(
     raise ValueError("split_strategy 必须是 'group' 或 'stratified'。")
 
 
+def split_train_val_test(
+    df: pd.DataFrame,
+    label_col: str,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+    split_strategy: str = "group",
+    group_col: str = "individual_id",
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Create train/validation/test partitions without using the test set for selection.
+
+    The test partition is drawn first. The validation ratio is then adjusted on
+    the remaining rows so that both requested ratios refer to the full dataset.
+    Group mode guarantees that an ``individual_id`` belongs to exactly one
+    partition.
+    """
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("val_ratio 必须位于 (0, 1)。")
+    if not 0.0 <= test_ratio < 1.0:
+        raise ValueError("test_ratio 必须位于 [0, 1)。")
+    if val_ratio + test_ratio >= 1.0:
+        raise ValueError("val_ratio + test_ratio 必须小于 1。")
+
+    if test_ratio == 0.0:
+        train_df, val_df = split_train_val(
+            df=df,
+            label_col=label_col,
+            val_ratio=val_ratio,
+            seed=seed,
+            split_strategy=split_strategy,
+            group_col=group_col,
+        )
+        return train_df, val_df, df.iloc[0:0].copy().reset_index(drop=True)
+
+    remaining_df, test_df = split_train_val(
+        df=df,
+        label_col=label_col,
+        val_ratio=test_ratio,
+        seed=seed,
+        split_strategy=split_strategy,
+        group_col=group_col,
+    )
+    adjusted_val_ratio = val_ratio / (1.0 - test_ratio)
+    train_df, val_df = split_train_val(
+        df=remaining_df,
+        label_col=label_col,
+        val_ratio=adjusted_val_ratio,
+        seed=seed + 1,
+        split_strategy=split_strategy,
+        group_col=group_col,
+    )
+    return train_df, val_df, test_df
+
+
 def count_group_overlap(train_df: pd.DataFrame, val_df: pd.DataFrame, group_col: str) -> int:
     """
     作用:
@@ -314,14 +369,18 @@ class NumpyTrainTransform:
         调用实例时返回 {"image": Tensor}。
     """
 
-    def __init__(self, image_size: int, cutout_p: float) -> None:
+    def __init__(self, image_size: int, cutout_p: float, crop_scale_min: float = 1.0) -> None:
         self.image_size = image_size
         self.cutout_p = cutout_p
+        self.crop_scale_min = crop_scale_min
         self.mean = np.array((0.485, 0.456, 0.406), dtype=np.float32)
         self.std = np.array((0.229, 0.224, 0.225), dtype=np.float32)
 
     def __call__(self, image: np.ndarray) -> Dict[str, torch.Tensor]:
-        image = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        if self.crop_scale_min < 1.0:
+            image = self._random_resized_crop(image)
+        else:
+            image = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
         if random.random() < 0.5:
             angle = random.uniform(-15.0, 15.0)
             h, w = image.shape[:2]
@@ -336,6 +395,25 @@ class NumpyTrainTransform:
         if random.random() < self.cutout_p:
             image = self._apply_cutout(image)
         return {"image": self._normalize_to_tensor(image)}
+
+    def _random_resized_crop(self, image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        area = height * width
+        for _ in range(10):
+            target_area = random.uniform(self.crop_scale_min, 1.0) * area
+            aspect_ratio = math.exp(random.uniform(math.log(0.75), math.log(4.0 / 3.0)))
+            crop_width = int(round(math.sqrt(target_area * aspect_ratio)))
+            crop_height = int(round(math.sqrt(target_area / aspect_ratio)))
+            if 0 < crop_width <= width and 0 < crop_height <= height:
+                x1 = random.randint(0, width - crop_width)
+                y1 = random.randint(0, height - crop_height)
+                crop = image[y1 : y1 + crop_height, x1 : x1 + crop_width]
+                return cv2.resize(crop, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        side = min(height, width)
+        y1 = (height - side) // 2
+        x1 = (width - side) // 2
+        crop = image[y1 : y1 + side, x1 : x1 + side]
+        return cv2.resize(crop, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
 
     def _apply_cutout(self, image: np.ndarray) -> np.ndarray:
         h, w = image.shape[:2]
@@ -417,7 +495,7 @@ def make_cutout_transform(image_size: int, p: float):
         )
 
 
-def build_transforms(image_size: int, cutout_p: float) -> Tuple[object, object]:
+def build_transforms(image_size: int, cutout_p: float, crop_scale_min: float = 1.0) -> Tuple[object, object]:
     """
     作用:
         构建训练和验证图像预处理流水线。
@@ -427,15 +505,42 @@ def build_transforms(image_size: int, cutout_p: float) -> Tuple[object, object]:
     输出:
         (训练 transforms, 验证 transforms)。
     """
+    if not 0.0 < crop_scale_min <= 1.0:
+        raise ValueError("crop_scale_min 必须位于 (0, 1]。")
     if A is None or ToTensorV2 is None:
         print("提示: 当前环境未安装 albumentations，已启用内置 OpenCV/Torch fallback 增强。")
-        return NumpyTrainTransform(image_size=image_size, cutout_p=cutout_p), NumpyValTransform(image_size=image_size)
+        return NumpyTrainTransform(
+            image_size=image_size,
+            cutout_p=cutout_p,
+            crop_scale_min=crop_scale_min,
+        ), NumpyValTransform(image_size=image_size)
 
     imagenet_mean = (0.485, 0.456, 0.406)
     imagenet_std = (0.229, 0.224, 0.225)
+    if crop_scale_min < 1.0:
+        try:
+            spatial_transform = A.RandomResizedCrop(
+                size=(image_size, image_size),
+                scale=(crop_scale_min, 1.0),
+                ratio=(0.75, 4.0 / 3.0),
+                interpolation=cv2.INTER_LINEAR,
+                p=1.0,
+            )
+        except TypeError:
+            spatial_transform = A.RandomResizedCrop(
+                height=image_size,
+                width=image_size,
+                scale=(crop_scale_min, 1.0),
+                ratio=(0.75, 4.0 / 3.0),
+                interpolation=cv2.INTER_LINEAR,
+                p=1.0,
+            )
+    else:
+        spatial_transform = A.Resize(image_size, image_size)
+
     train_tfms = A.Compose(
         [
-            A.Resize(image_size, image_size),
+            spatial_transform,
             A.Rotate(limit=15, border_mode=cv2.BORDER_REFLECT_101, p=0.5),
             A.HorizontalFlip(p=0.5),
             A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=0.7),

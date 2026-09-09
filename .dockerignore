@@ -1,0 +1,15 @@
+.git
+.idea
+.vscode
+.firecrawl
+__pycache__
+*.pyc
+archive
+outputs
+logs
+*.pth
+*.pt
+*.ckpt
+*.tar.gz
+.codex_tmp_doc_extract
+tests

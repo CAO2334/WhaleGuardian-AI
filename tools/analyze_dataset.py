@@ -45,8 +45,7 @@ from data.dataset import (
     normalize_species_column,
     split_train_val,
 )
-from models.resnet_baseline import ResNet50Baseline
-from models.resnet_transformer import ResNet50_Transformer
+from models.factory import load_model_from_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-fix-species-typos", dest="fix_species_typos", action="store_false")
     parser.add_argument("--checkpoint", default=None, help="可选：best_model.pth 路径，用于计算 per-class F1 和混淆类别对")
     parser.add_argument("--class-map", default="outputs/class_to_idx.json", help="class_to_idx.json 路径；缺失时根据 CSV 重建")
-    parser.add_argument("--model-type", choices=("auto", "transformer", "baseline"), default="auto")
+    parser.add_argument("--model-type", choices=("auto", "transformer", "baseline", "metric"), default="auto")
     parser.add_argument("--batch-size", type=int, default=16, help="checkpoint 评估 batch size")
     parser.add_argument("--num-workers", type=int, default=0, help="checkpoint 评估 DataLoader workers")
     parser.add_argument("--image-size", type=int, default=None, help="覆盖 checkpoint 中保存的 image_size")
@@ -319,37 +318,13 @@ def build_model(
     输出:
         eval 模式的 PyTorch 模型。
     """
-    cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-    if model_type == "auto":
-        model_type = str(cfg.get("model_type", "transformer"))
-
-    image_size = image_size_override or int(cfg.get("image_size", 512))
-    if model_type == "baseline":
-        model = ResNet50Baseline(
-            num_classes=num_classes,
-            pretrained=False,
-            dropout=float(cfg.get("dropout", 0.1)),
-        )
-    else:
-        model = ResNet50_Transformer(
-            num_classes=num_classes,
-            image_size=image_size,
-            transformer_dim=int(cfg.get("transformer_dim", 512)),
-            transformer_depth=int(cfg.get("transformer_depth", 2)),
-            transformer_heads=int(cfg.get("transformer_heads", 8)),
-            transformer_mlp_ratio=float(cfg.get("transformer_mlp_ratio", 4.0)),
-            pooling=str(cfg.get("transformer_pooling", "cls")),
-            dropout=float(cfg.get("dropout", 0.1)),
-            pretrained=False,
-            backbone_stage=str(cfg.get("backbone_stage", "layer3")),
-            token_pool_size=int(cfg.get("token_pool_size", 16)),
-        )
-
-    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    model.load_state_dict(state_dict, strict=True)
-    model.to(device)
-    model.eval()
-    return model
+    return load_model_from_checkpoint(
+        checkpoint,
+        num_classes=num_classes,
+        model_type=model_type,
+        image_size=image_size_override,
+        device=device,
+    )
 
 
 @torch.no_grad()

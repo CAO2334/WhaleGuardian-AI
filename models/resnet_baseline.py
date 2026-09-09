@@ -74,3 +74,7 @@ class ResNet50Baseline(nn.Module):
         for name, param in self.backbone.named_parameters():
             if not name.startswith("fc."):
                 param.requires_grad = trainable
+
+    def get_gradcam_target_layer(self) -> nn.Module:
+        """Return the final convolutional block used by Grad-CAM."""
+        return self.backbone.layer4[-1]

@@ -37,6 +37,9 @@ archive/*.7z
 # Training outputs, reports, and logs
 outputs/
 logs/
+autodl_research_*/
+autodl_research_*.tar.gz
+whale_research_*.tar.gz
 *.log
 whale_web/flask_stdout.log
 whale_web/flask_stderr.log

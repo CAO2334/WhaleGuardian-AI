@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
+import hashlib
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +17,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -29,15 +31,17 @@ from data.dataset import (
     normalize_species_column,
     resolve_data_paths,
     resolve_num_workers,
-    split_train_val,
+    split_train_val_test,
 )
+from models.factory import build_model
 from models.resnet_baseline import ResNet50Baseline
+from models.resnet_metric import ResNet50MetricClassifier
 from models.resnet_transformer import ResNet50_Transformer
 from utils.losses import FocalLoss, compute_class_balanced_alpha, mixup_criterion, mixup_data
 from utils.metrics import ModelEMA, accuracy_from_logits, create_summary_writer, log_epoch_metrics, macro_f1_score
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = False) -> None:
     """
     作用:
         固定 Python、NumPy、PyTorch 的随机种子，降低训练结果的随机波动。
@@ -50,7 +54,20 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+    torch.use_deterministic_algorithms(deterministic, warn_only=True)
+
+
+def validate_config(cfg: TrainConfig) -> None:
+    if not 0.0 < cfg.val_ratio < 1.0:
+        raise ValueError("val_ratio 必须位于 (0, 1)。")
+    if not 0.0 <= cfg.test_ratio < 1.0 or cfg.val_ratio + cfg.test_ratio >= 1.0:
+        raise ValueError("test_ratio 必须 >= 0，且 val_ratio + test_ratio < 1。")
+    if not 0.0 < cfg.crop_scale_min <= 1.0:
+        raise ValueError("crop_scale_min 必须位于 (0, 1]。")
+    if cfg.model_type == "metric" and cfg.metric_head == "arcface" and cfg.mixup_alpha > 0:
+        raise ValueError("ArcFace 的目标角度间隔与 Mixup 软标签不兼容，请设置 --mixup-alpha 0。")
 
 
 def build_optimizer(model: nn.Module, cfg: TrainConfig) -> AdamW:
@@ -78,6 +95,17 @@ def build_optimizer(model: nn.Module, cfg: TrainConfig) -> AdamW:
             param_groups.append(
                 {"name": "semantic_project", "params": [p for p in model.semantic_project.parameters() if p.requires_grad], "lr": cfg.lr}
             )
+    elif isinstance(model, ResNet50MetricClassifier):
+        param_groups = [
+            {"name": "backbone", "params": [p for p in model.backbone.parameters() if p.requires_grad], "lr": cfg.lr},
+            {"name": "pool", "params": [p for p in model.pool.parameters() if p.requires_grad], "lr": cfg.lr},
+            {"name": "embedding", "params": [p for p in model.embedding.parameters() if p.requires_grad], "lr": cfg.lr},
+            {
+                "name": "metric_head",
+                "params": [p for p in model.head.parameters() if p.requires_grad],
+                "lr": cfg.lr * cfg.head_lr_multiplier,
+            },
+        ]
     else:
         param_groups = [
             {"name": "model", "params": [p for p in model.parameters() if p.requires_grad], "lr": cfg.lr},
@@ -104,6 +132,8 @@ def build_experiment_name(cfg: TrainConfig) -> str:
         parts.append(cfg.backbone_stage)
         if cfg.token_pool_size > 0:
             parts.append(f"tp{cfg.token_pool_size}")
+    if cfg.model_type == "metric":
+        parts.extend([cfg.metric_pooling, cfg.metric_head])
     parts.append(cfg.loss_type)
     parts.append("mixup" if cfg.mixup_alpha > 0 else "nomixup")
     parts.append("cutout" if cfg.cutout_p > 0 else "nocutout")
@@ -146,6 +176,7 @@ def build_experiment_summary(
     num_classes: int,
     train_size: int,
     val_size: int,
+    test_size: int,
 ) -> Dict[str, object]:
     """
     作用:
@@ -172,7 +203,11 @@ def build_experiment_summary(
         "mixup": cfg.mixup_alpha > 0,
         "cutout": cfg.cutout_p > 0,
         "transformer": is_transformer,
-        "pooling": cfg.transformer_pooling if is_transformer else "gap",
+        "pooling": (
+            cfg.transformer_pooling
+            if is_transformer
+            else cfg.metric_pooling if cfg.model_type == "metric" else "gap"
+        ),
         "cls_token": is_transformer and cfg.transformer_pooling == "cls",
         "token_pool_size": cfg.token_pool_size if is_transformer else 0,
         "multiscale": is_transformer and cfg.backbone_stage == "layer3_layer4",
@@ -180,6 +215,15 @@ def build_experiment_summary(
         "backbone_stage": cfg.backbone_stage if is_transformer else "resnet50",
         "split_strategy": cfg.split_strategy,
         "group_col": cfg.group_col,
+        "split_seed": cfg.split_seed,
+        "seed": cfg.seed,
+        "deterministic": cfg.deterministic,
+        "val_ratio": cfg.val_ratio,
+        "test_ratio": cfg.test_ratio,
+        "crop_scale_min": cfg.crop_scale_min,
+        "metric_pooling": cfg.metric_pooling if cfg.model_type == "metric" else "",
+        "metric_head": cfg.metric_head if cfg.model_type == "metric" else "",
+        "arcface_subcenters": cfg.arcface_subcenters if cfg.model_type == "metric" else 0,
         "epochs": cfg.epochs,
         "best_epoch": best_epoch,
         "best_val_acc": best_val_acc,
@@ -187,11 +231,16 @@ def build_experiment_summary(
         "num_classes": num_classes,
         "train_size": train_size,
         "val_size": val_size,
+        "test_size": test_size,
         "best_model_path": str(best_path),
     }
 
 
-def save_experiment_summary(output_dir: Path, summary: Dict[str, object]) -> None:
+def save_experiment_summary(
+    output_dir: Path,
+    summary: Dict[str, object],
+    results_csv: str | None = None,
+) -> None:
     """
     作用:
         保存单次实验摘要，并追加到消融实验汇总 CSV。
@@ -205,11 +254,17 @@ def save_experiment_summary(output_dir: Path, summary: Dict[str, object]) -> Non
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    table_path = output_dir.parent / "ablation_results.csv" if output_dir.parent.name == "ablations" else output_dir / "ablation_results.csv"
+    table_path = Path(results_csv) if results_csv else (
+        output_dir.parent / "ablation_results.csv" if output_dir.parent.name == "ablations" else output_dir / "ablation_results.csv"
+    )
+    table_path.parent.mkdir(parents=True, exist_ok=True)
     row = pd.DataFrame([summary])
     if table_path.exists():
         old = pd.read_csv(table_path)
         table = pd.concat([old, row], ignore_index=True)
+        dedupe_columns = [column for column in ("experiment_name", "seed") if column in table.columns]
+        if dedupe_columns:
+            table = table.drop_duplicates(subset=dedupe_columns, keep="last")
     else:
         table = row
     table.to_csv(table_path, index=False, encoding="utf-8-sig")
@@ -255,17 +310,25 @@ def build_scheduler(
         warmup_epochs = cfg.warmup_epochs
     warmup_epochs = min(max(0, warmup_epochs), max(0, total_epochs - 1))
 
-    if warmup_epochs == 0:
-        return CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=cfg.lr * 0.01)
-
     start_factor = min(1.0, max(1e-8, cfg.warmup_start_lr / cfg.lr))
-    warmup = LinearLR(optimizer, start_factor=start_factor, end_factor=1.0, total_iters=warmup_epochs)
-    cosine = CosineAnnealingLR(optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=cfg.lr * 0.01)
-    return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+    min_factor = 0.01
+
+    def schedule_factor(epoch_index: int) -> float:
+        if warmup_epochs > 0 and epoch_index < warmup_epochs:
+            progress = epoch_index / max(1, warmup_epochs)
+            return start_factor + (1.0 - start_factor) * progress
+        cosine_epochs = max(1, total_epochs - warmup_epochs)
+        progress = min(1.0, max(0.0, (epoch_index - warmup_epochs) / cosine_epochs))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    # The same multiplicative factor is applied to every parameter group, so
+    # a 10x metric-head learning rate stays 10x throughout warmup and cosine.
+    return LambdaLR(optimizer, lr_lambda=schedule_factor)
 
 
 def train_one_epoch(
-    model: ResNet50_Transformer,
+    model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -301,11 +364,15 @@ def train_one_epoch(
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         batch_size = images.size(0)
-        mixed_images, labels_a, labels_b, lam = mixup_data(images, labels, alpha=mixup_alpha)
+        uses_arcface = isinstance(model, ResNet50MetricClassifier) and model.head_type == "arcface"
+        if uses_arcface:
+            mixed_images, labels_a, labels_b, lam = images, labels, labels, 1.0
+        else:
+            mixed_images, labels_a, labels_b, lam = mixup_data(images, labels, alpha=mixup_alpha)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-            logits = model(mixed_images)
+            logits = model(mixed_images, labels_a) if uses_arcface else model(mixed_images)
             loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
 
         scaler.scale(loss).backward()
@@ -441,6 +508,56 @@ def print_dataset_summary(df: pd.DataFrame, class_to_idx: Dict[str, int]) -> Non
     print(counts.tail(10).to_string())
 
 
+def save_split_artifacts(
+    output_dir: Path,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    cfg: TrainConfig,
+) -> None:
+    """Persist exact partitions so every later report evaluates identical rows."""
+    split_dir = output_dir / "splits"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    split_paths = {
+        "train": split_dir / "train.csv",
+        "val": split_dir / "val.csv",
+        "test": split_dir / "test.csv",
+    }
+    train_df.to_csv(split_paths["train"], index=False, encoding="utf-8-sig")
+    val_df.to_csv(split_paths["val"], index=False, encoding="utf-8-sig")
+    test_df.to_csv(split_paths["test"], index=False, encoding="utf-8-sig")
+
+    overlap = {
+        "train_val": count_group_overlap(train_df, val_df, cfg.group_col),
+        "train_test": count_group_overlap(train_df, test_df, cfg.group_col) if not test_df.empty else 0,
+        "val_test": count_group_overlap(val_df, test_df, cfg.group_col) if not test_df.empty else 0,
+    }
+    total_samples = len(train_df) + len(val_df) + len(test_df)
+    summary = {
+        "strategy": cfg.split_strategy,
+        "group_col": cfg.group_col,
+        "split_seed": cfg.split_seed,
+        "requested_val_ratio": cfg.val_ratio,
+        "requested_test_ratio": cfg.test_ratio,
+        "train_samples": len(train_df),
+        "val_samples": len(val_df),
+        "test_samples": len(test_df),
+        "actual_ratios": {
+            "train": len(train_df) / max(total_samples, 1),
+            "val": len(val_df) / max(total_samples, 1),
+            "test": len(test_df) / max(total_samples, 1),
+        },
+        "group_overlap": overlap,
+        "sha256": {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in split_paths.items()
+        },
+        "leakage_free": all(value == 0 for value in overlap.values()) if cfg.split_strategy == "group" else None,
+    }
+    with open(split_dir / "split_summary.json", "w", encoding="utf-8") as file:
+        json.dump(summary, file, ensure_ascii=False, indent=2)
+
+
 def main() -> None:
     """
     作用:
@@ -451,7 +568,8 @@ def main() -> None:
         无返回值；生成 best_model.pth、class_to_idx.json、metrics.json、TensorBoard 日志等训练产物。
     """
     cfg = parse_args()
-    set_seed(cfg.seed)
+    validate_config(cfg)
+    set_seed(cfg.seed, deterministic=cfg.deterministic)
     experiment_name = build_experiment_name(cfg)
 
     train_csv, image_dir = resolve_data_paths(cfg)
@@ -470,23 +588,34 @@ def main() -> None:
     class_to_idx, idx_to_class = build_label_maps(df["species"])
     print_dataset_summary(df, class_to_idx)
 
-    train_df, val_df = split_train_val(
+    train_df, val_df, test_df = split_train_val_test(
         df=df,
         label_col="species",
         val_ratio=cfg.val_ratio,
-        seed=cfg.seed,
+        test_ratio=cfg.test_ratio,
+        seed=cfg.split_seed,
         split_strategy=cfg.split_strategy,
         group_col=cfg.group_col,
     )
-    print(f"训练集: {len(train_df)}  验证集: {len(val_df)}")
+    print(f"训练集: {len(train_df)}  验证集: {len(val_df)}  独立测试集: {len(test_df)}")
     if cfg.split_strategy == "group":
-        overlap = count_group_overlap(train_df, val_df, cfg.group_col)
-        print(f"Group split: {cfg.group_col} 训练/验证重叠数: {overlap}")
+        train_val_overlap = count_group_overlap(train_df, val_df, cfg.group_col)
+        train_test_overlap = count_group_overlap(train_df, test_df, cfg.group_col) if not test_df.empty else 0
+        val_test_overlap = count_group_overlap(val_df, test_df, cfg.group_col) if not test_df.empty else 0
+        print(
+            f"Group split: {cfg.group_col} overlap "
+            f"train/val={train_val_overlap}, train/test={train_test_overlap}, val/test={val_test_overlap}"
+        )
 
     with open(output_dir / "class_to_idx.json", "w", encoding="utf-8") as f:
         json.dump(class_to_idx, f, ensure_ascii=False, indent=2)
+    save_split_artifacts(output_dir, train_df, val_df, test_df, cfg)
 
-    train_tfms, val_tfms = build_transforms(image_size=cfg.image_size, cutout_p=cfg.cutout_p)
+    train_tfms, val_tfms = build_transforms(
+        image_size=cfg.image_size,
+        cutout_p=cfg.cutout_p,
+        crop_scale_min=cfg.crop_scale_min,
+    )
     train_dataset = WhaleSpeciesDataset(train_df, image_dir, class_to_idx, transforms=train_tfms)
     val_dataset = WhaleSpeciesDataset(val_df, image_dir, class_to_idx, transforms=val_tfms)
 
@@ -496,31 +625,17 @@ def main() -> None:
     train_loader = build_dataloader(train_dataset, cfg.batch_size, True, num_workers, pin_memory, drop_last=True)
     val_loader = build_dataloader(val_dataset, cfg.batch_size, False, num_workers, pin_memory, drop_last=False)
 
-    if cfg.model_type == "baseline":
-        model = ResNet50Baseline(
-            num_classes=len(class_to_idx),
-            pretrained=cfg.pretrained,
-            dropout=cfg.dropout,
-        ).to(device)
-    else:
-        model = ResNet50_Transformer(
-            num_classes=len(class_to_idx),
-            image_size=cfg.image_size,
-            transformer_dim=cfg.transformer_dim,
-            transformer_depth=cfg.transformer_depth,
-            transformer_heads=cfg.transformer_heads,
-            transformer_mlp_ratio=cfg.transformer_mlp_ratio,
-            pooling=cfg.transformer_pooling,
-            dropout=cfg.dropout,
-            pretrained=cfg.pretrained,
-            backbone_stage=cfg.backbone_stage,
-            token_pool_size=cfg.token_pool_size,
-        ).to(device)
+    model = build_model(cfg, num_classes=len(class_to_idx)).to(device)
     print(f"模型类型: {cfg.model_type}, loss: {cfg.loss_type}")
     if cfg.model_type == "transformer":
         print(f"Transformer pooling: {cfg.transformer_pooling}")
         print(f"Token pooling: {cfg.token_pool_size if cfg.token_pool_size > 0 else 'disabled'}")
         print(f"Multi-scale fusion: {cfg.backbone_stage == 'layer3_layer4'}")
+    if cfg.model_type == "metric":
+        print(
+            f"Metric model: pooling={cfg.metric_pooling}, head={cfg.metric_head}, "
+            f"subcenters={cfg.arcface_subcenters}, head_lr={cfg.lr * cfg.head_lr_multiplier:.6g}"
+        )
 
     if cfg.freeze_backbone_epochs > 0:
         model.set_backbone_trainable(False)
@@ -603,8 +718,9 @@ def main() -> None:
         num_classes=len(class_to_idx),
         train_size=len(train_df),
         val_size=len(val_df),
+        test_size=len(test_df),
     )
-    save_experiment_summary(output_dir, summary)
+    save_experiment_summary(output_dir, summary, results_csv=cfg.results_csv)
 
 
 if __name__ == "__main__":

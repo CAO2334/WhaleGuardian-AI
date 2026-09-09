@@ -1,5 +1,5 @@
 """
-为 ResNet50-Transformer 生成 Grad-CAM 可解释性图。
+为 baseline、metric 或 ResNet50-Transformer 生成 Grad-CAM 可解释性图。
 
 示例:
     python tools/generate_gradcam.py --image archive/train_images/00021adfb725ed.jpg
@@ -27,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.resnet_transformer import ResNet50_Transformer
+from models.factory import load_model_from_checkpoint
 from utils.report_paths import timestamped_path
 
 
@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     输出:
         argparse.Namespace 参数对象。
     """
-    parser = argparse.ArgumentParser(description="生成 ResNet50-Transformer Grad-CAM 图")
+    parser = argparse.ArgumentParser(description="生成鲸类分类模型 Grad-CAM 图")
     parser.add_argument("--image", required=True, help="输入图片路径")
     parser.add_argument("--checkpoint", default="outputs/best_model.pth", help="模型权重路径")
     parser.add_argument("--class-map", default="outputs/class_to_idx.json", help="class_to_idx.json 路径")
@@ -77,26 +77,13 @@ def load_model(checkpoint_path: Path, num_classes: int, image_size: Optional[int
     输出:
         eval 模式的模型。
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-    model = ResNet50_Transformer(
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    return load_model_from_checkpoint(
+        checkpoint,
         num_classes=num_classes,
-        image_size=image_size or int(cfg.get("image_size", 512)),
-        transformer_dim=int(cfg.get("transformer_dim", 512)),
-        transformer_depth=int(cfg.get("transformer_depth", 2)),
-        transformer_heads=int(cfg.get("transformer_heads", 8)),
-        transformer_mlp_ratio=float(cfg.get("transformer_mlp_ratio", 4.0)),
-        pooling=str(cfg.get("transformer_pooling", "cls")),
-        dropout=float(cfg.get("dropout", 0.1)),
-        pretrained=False,
-        backbone_stage=str(cfg.get("backbone_stage", "layer3")),
-        token_pool_size=int(cfg.get("token_pool_size", 16)),
+        image_size=image_size,
+        device=device,
     )
-    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    model.load_state_dict(state_dict, strict=True)
-    model.to(device)
-    model.eval()
-    return model
 
 
 def preprocess_image(image_path: Path, image_size: int) -> Tuple[torch.Tensor, np.ndarray]:
@@ -120,7 +107,7 @@ def preprocess_image(image_path: Path, image_size: int) -> Tuple[torch.Tensor, n
     return tensor, original
 
 
-def get_target_layer(model: ResNet50_Transformer) -> torch.nn.Module:
+def get_target_layer(model: torch.nn.Module) -> torch.nn.Module:
     """
     作用:
         获取 Grad-CAM 需要挂钩的目标卷积层。
@@ -129,11 +116,13 @@ def get_target_layer(model: ResNet50_Transformer) -> torch.nn.Module:
     输出:
         目标 nn.Module。
     """
+    if not hasattr(model, "get_gradcam_target_layer"):
+        raise TypeError(f"模型 {type(model).__name__} 未提供 Grad-CAM 目标层。")
     return model.get_gradcam_target_layer()
 
 
 def generate_cam(
-    model: ResNet50_Transformer,
+    model: torch.nn.Module,
     input_tensor: torch.Tensor,
     target_index: Optional[int],
     device: torch.device,
@@ -257,6 +246,7 @@ def main() -> None:
         raise FileNotFoundError(f"找不到类别映射: {class_map_path}")
     if not image_path.exists():
         raise FileNotFoundError(f"找不到图片: {image_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device)

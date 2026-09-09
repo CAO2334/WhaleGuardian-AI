@@ -29,10 +29,12 @@ from data.dataset import (
     resolve_data_paths,
     resolve_num_workers,
     split_train_val,
+    split_train_val_test,
     stratified_split,
 )
 from models.resnet_transformer import ResNet50_Transformer
 from models.resnet_baseline import ResNet50Baseline
+from models.resnet_metric import ResNet50MetricClassifier
 from train import (
     build_criterion,
     build_experiment_name,
@@ -73,9 +75,11 @@ __all__ = [
     "resolve_data_paths",
     "resolve_num_workers",
     "split_train_val",
+    "split_train_val_test",
     "stratified_split",
     "ResNet50_Transformer",
     "ResNet50Baseline",
+    "ResNet50MetricClassifier",
     "build_criterion",
     "build_experiment_name",
     "build_experiment_summary",

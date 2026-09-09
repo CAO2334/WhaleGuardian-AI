@@ -20,13 +20,13 @@ from typing import Any, Dict, Tuple
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.resnet_baseline import ResNet50Baseline
-from models.resnet_transformer import ResNet50_Transformer
+from models.factory import load_model_from_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,11 +46,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version", default="v1", help="模型版本号，写入 artifact 元数据")
     parser.add_argument("--metrics", default=None, help="可选 metrics.json 路径，会复制到 artifact 中")
     parser.add_argument("--class-map", default="outputs/class_to_idx.json", help="类别映射路径；artifact 导出时会复制为 class_to_idx.json")
-    parser.add_argument("--model-type", choices=("auto", "transformer", "baseline"), default="auto", help="模型结构类型")
+    parser.add_argument("--model-type", choices=("auto", "transformer", "baseline", "metric"), default="auto", help="模型结构类型")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset 版本")
     parser.add_argument("--batch-size", type=int, default=1, help="导出时 dummy input 的 batch size")
     parser.add_argument("--image-size", type=int, default=None, help="覆盖 checkpoint 中保存的 image_size")
     parser.add_argument("--no-check", action="store_true", help="跳过 torch.onnx.export 的模型检查")
+    parser.add_argument("--no-runtime-check", action="store_true", help="跳过 ONNX Runtime 与 PyTorch 数值一致性检查")
     return parser.parse_args()
 
 
@@ -85,6 +86,8 @@ def infer_model_name(cfg: Dict[str, Any], model_type: str) -> str:
         model_type = str(cfg.get("model_type", "transformer"))
     if model_type == "baseline":
         return "whale_resnet50_baseline"
+    if model_type == "metric":
+        return "whale_resnet50_metric"
     return "whale_resnet50_transformer"
 
 
@@ -119,6 +122,36 @@ def create_metrics_payload(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
             if hasattr(value, "item"):
                 value = value.item()
             payload[key] = value
+    return payload
+
+
+def validate_onnx_runtime(
+    model: torch.nn.Module,
+    dummy_input: torch.Tensor,
+    output_path: Path,
+) -> Dict[str, Any]:
+    """Compare ONNX Runtime logits with the exported PyTorch model."""
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise RuntimeError("缺少 onnxruntime，无法做导出数值一致性检查。") from exc
+
+    with torch.no_grad():
+        torch_output = model(dummy_input).detach().cpu().numpy()
+    session = ort.InferenceSession(str(output_path), providers=["CPUExecutionProvider"])
+    ort_output = session.run(None, {"images": dummy_input.cpu().numpy()})[0]
+    abs_diff = np.abs(torch_output - ort_output)
+    passed = bool(np.allclose(torch_output, ort_output, rtol=1e-3, atol=1e-4))
+    payload = {
+        "passed": passed,
+        "provider": session.get_providers()[0],
+        "max_abs_diff": float(abs_diff.max()),
+        "mean_abs_diff": float(abs_diff.mean()),
+        "rtol": 1e-3,
+        "atol": 1e-4,
+    }
+    if not passed:
+        raise RuntimeError(f"ONNX Runtime 数值检查失败: {payload}")
     return payload
 
 
@@ -189,6 +222,7 @@ def package_artifact(
         "class_map_file": "class_to_idx.json",
         "config_file": "config.json",
         "metrics_file": "metrics.json",
+        "onnx_validation_file": "onnx_validation.json",
         "num_classes": len(class_to_idx) if class_to_idx else None,
         "image_size": image_size,
         "model_type": model_type,
@@ -217,37 +251,13 @@ def build_model_from_checkpoint(
     if not class_to_idx:
         raise ValueError("checkpoint 中缺少 class_to_idx，无法确定 num_classes。")
 
-    if model_type == "auto":
-        model_type = str(cfg.get("model_type", "transformer"))
-
-    num_classes = len(class_to_idx)
-    image_size = image_size_override or int(cfg.get("image_size", 512))
-
-    if model_type == "baseline":
-        model = ResNet50Baseline(
-            num_classes=num_classes,
-            pretrained=False,
-            dropout=float(cfg.get("dropout", 0.1)),
-        )
-    else:
-        model = ResNet50_Transformer(
-            num_classes=num_classes,
-            image_size=image_size,
-            transformer_dim=int(cfg.get("transformer_dim", 512)),
-            transformer_depth=int(cfg.get("transformer_depth", 2)),
-            transformer_heads=int(cfg.get("transformer_heads", 8)),
-            transformer_mlp_ratio=float(cfg.get("transformer_mlp_ratio", 4.0)),
-            pooling=str(cfg.get("transformer_pooling", "cls")),
-            dropout=float(cfg.get("dropout", 0.1)),
-            pretrained=False,
-            backbone_stage=str(cfg.get("backbone_stage", "layer3")),
-            token_pool_size=int(cfg.get("token_pool_size", 16)),
-        )
-
-    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    model.load_state_dict(state_dict, strict=True)
-    model.eval()
-    return model
+    return load_model_from_checkpoint(
+        checkpoint,
+        num_classes=len(class_to_idx),
+        model_type=model_type,
+        image_size=image_size_override,
+        device="cpu",
+    )
 
 
 def main() -> None:
@@ -297,7 +307,23 @@ def main() -> None:
         },
         training=torch.onnx.TrainingMode.EVAL,
         verbose=False,
+        # Keep deployment compatible with minimal AutoDL environments that do
+        # not install the newer onnxscript-based dynamo exporter.
+        dynamo=False,
     )
+
+    if not args.no_runtime_check:
+        validation = validate_onnx_runtime(model, dummy_input, output_path)
+        validation_path = (
+            artifact_dir / "onnx_validation.json"
+            if artifact_dir is not None
+            else output_path.with_name(output_path.stem + "_validation.json")
+        )
+        write_json(validation_path, validation)
+        print(
+            "ONNX Runtime parity: OK, "
+            f"max_abs_diff={validation['max_abs_diff']:.6g}, provider={validation['provider']}"
+        )
 
     if not args.no_check:
         try:

@@ -92,31 +92,61 @@ def build_report_table(df: pd.DataFrame) -> List[str]:
         Markdown 文本行列表。
     """
     lines = [
-        "| 实验 | 模型 | Focal | Mixup | Cutout | Transformer | CLS | EMA | Acc | Macro F1 | 最佳 Epoch |",
-        "|---|---|---|---|---|---|---|---|---:|---:|---:|",
+        "| 实验 | 模型 | runs | Focal | Mixup | Cutout | EMA | Val Acc (mean±std) | Val Macro F1 (mean±std) |",
+        "|---|---|---:|---|---|---|---|---:|---:|",
     ]
     for _, row in df.iterrows():
         model_name = str(row.get("model_type", ""))
+        if model_name == "metric":
+            model_name += f"+{row.get('pooling', '')}+{row.get('metric_head', '')}"
         if bool(row.get("multiscale", False)):
             model_name += "+multiscale"
         if int(row.get("token_pool_size", 0) or 0) > 0 and bool(row.get("transformer", False)):
             model_name += f"+tp{int(row['token_pool_size'])}"
         lines.append(
-            "| {experiment} | {model} | {focal} | {mixup} | {cutout} | {transformer} | {cls} | {ema} | {acc:.4f} | {f1:.4f} | {epoch} |".format(
+            "| {experiment} | {model} | {runs} | {focal} | {mixup} | {cutout} | {ema} | {acc:.4f}±{acc_std:.4f} | {f1:.4f}±{f1_std:.4f} |".format(
                 experiment=row.get("experiment_name", ""),
                 model=model_name,
+                runs=int(row.get("runs", 1)),
                 focal=format_bool(row.get("focal", False)),
                 mixup=format_bool(row.get("mixup", False)),
                 cutout=format_bool(row.get("cutout", False)),
-                transformer=format_bool(row.get("transformer", False)),
-                cls=format_bool(row.get("cls_token", False)),
                 ema=format_bool(row.get("ema", False)),
-                acc=float(row.get("best_val_acc", 0.0)),
-                f1=float(row.get("best_val_macro_f1", 0.0)),
-                epoch=int(row.get("best_epoch", 0)),
+                acc=float(row.get("val_acc_mean", row.get("best_val_acc", 0.0))),
+                acc_std=float(row.get("val_acc_std", 0.0)),
+                f1=float(row.get("val_macro_f1_mean", row.get("best_val_macro_f1", 0.0))),
+                f1_std=float(row.get("val_macro_f1_std", 0.0)),
             )
         )
     return lines
+
+
+def aggregate_results(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate repeated seeds without silently treating them as separate methods."""
+    config_columns = [
+        column
+        for column in (
+            "experiment_name", "model_type", "focal", "mixup", "cutout", "transformer",
+            "cls_token", "ema", "multiscale", "token_pool_size", "pooling", "metric_head",
+            "crop_scale_min",
+        )
+        if column in df.columns
+    ]
+    grouped = df.groupby("experiment_name", sort=False, dropna=False)
+    rows = []
+    for _, group in grouped:
+        row = {column: group.iloc[0][column] for column in config_columns}
+        row.update(
+            {
+                "runs": len(group),
+                "val_acc_mean": float(group["best_val_acc"].mean()),
+                "val_acc_std": float(group["best_val_acc"].std(ddof=0)),
+                "val_macro_f1_mean": float(group["best_val_macro_f1"].mean()),
+                "val_macro_f1_std": float(group["best_val_macro_f1"].std(ddof=0)),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("val_macro_f1_mean", ascending=False).reset_index(drop=True)
 
 
 def plot_macro_f1(df: pd.DataFrame, output_path: Path) -> None:
@@ -129,14 +159,14 @@ def plot_macro_f1(df: pd.DataFrame, output_path: Path) -> None:
     输出:
         无返回值；保存 PNG 图片。
     """
-    plot_df = df.copy()
-    plot_df = plot_df.sort_values("best_val_macro_f1", ascending=True)
+    plot_df = df.copy().sort_values("val_macro_f1_mean", ascending=True)
     labels = plot_df["experiment_name"].astype(str).tolist()
-    values = plot_df["best_val_macro_f1"].astype(float).tolist()
+    values = plot_df["val_macro_f1_mean"].astype(float).tolist()
+    errors = plot_df["val_macro_f1_std"].astype(float).tolist()
 
     height = max(4.8, 0.46 * len(plot_df) + 2.0)
     plt.figure(figsize=(12, height))
-    plt.barh(labels, values, color="#2dd4bf")
+    plt.barh(labels, values, xerr=errors, color="#2dd4bf", ecolor="#334155", capsize=3)
     plt.xlim(0, 1)
     plt.xlabel("Validation Macro F1")
     plt.ylabel("Experiment")
@@ -162,33 +192,40 @@ def write_report(df: pd.DataFrame, csv_path: Path, output_path: Path, plot_path:
     输出:
         无返回值；保存 Markdown 文件。
     """
-    best_idx = df["best_val_macro_f1"].astype(float).idxmax()
+    best_idx = df["val_macro_f1_mean"].astype(float).idxmax()
     best = df.loc[best_idx]
     lines = [
         "# 消融实验报告",
         "",
         f"- 数据来源: `{csv_path.relative_to(PROJECT_ROOT)}`",
-        f"- 实验数量: {len(df)}",
+        f"- 实验配置数: {len(df)}",
+        f"- 总训练次数: {int(df['runs'].sum())}",
         f"- 最佳实验: `{best.get('experiment_name', '')}`",
-        f"- 最佳验证 Accuracy: {float(best.get('best_val_acc', 0.0)):.4f}",
-        f"- 最佳验证 Macro F1: {float(best.get('best_val_macro_f1', 0.0)):.4f}",
+        f"- 最佳验证 Accuracy (mean±std): {float(best.get('val_acc_mean', 0.0)):.4f}±{float(best.get('val_acc_std', 0.0)):.4f}",
+        f"- 最佳验证 Macro F1 (mean±std): {float(best.get('val_macro_f1_mean', 0.0)):.4f}±{float(best.get('val_macro_f1_std', 0.0)):.4f}",
+        "- 选择规则: 仅按验证集多随机种子平均 Macro F1 排名；独立测试集不参与模型选择",
         f"- Macro F1 图: `{plot_path.relative_to(PROJECT_ROOT)}`",
         "",
         "## 结果表",
         "",
     ]
     lines.extend(build_report_table(df))
-    lines.extend(
-        [
-            "",
-            "## 结论填写建议",
-            "",
-            "- 对比 `ResNet50 CE` 与 `ResNet50 Focal`，说明 Focal Loss 对长尾类别是否有效。",
-            "- 对比带/不带 Mixup、Cutout、EMA 的结果，说明训练策略对泛化的贡献。",
-            "- 对比 `Transformer mean` 与 `Transformer cls`，说明 CLS Token 是否优于平均池化。",
-            "- 对比 baseline 与 Transformer，说明全局空间关系建模是否提升 Macro F1。",
+    controlled_suite = any("metric_" in str(name) for name in df["experiment_name"])
+    if controlled_suite:
+        suggestions = [
+            "- `01 -> 02` 检验随机裁剪能否减轻背景/填充区域依赖。",
+            "- `03 -> 04` 只改变 GAP/GeM，检验池化策略。",
+            "- `04 -> 05` 只改变 Linear/Sub-center ArcFace，检验度量学习分类头。",
+            "- `02 -> 06` 对比 ResNet50 与 Transformer，全局关系建模是否带来稳定收益。",
+            "- `07` 保留历史最佳配方，作为新受控实验体系与旧结论的连接点。",
         ]
-    )
+    else:
+        suggestions = [
+            "- 对比 ResNet50 CE 与 Focal，说明 Focal Loss 在当前长尾设定下是否有效。",
+            "- 带 Mixup/Cutout/EMA 的旧实验同时改变多个因素，只能描述相关性，不能做单因素归因。",
+            "- 对比 Transformer mean/CLS，说明聚合方式的观测差异。",
+        ]
+    lines.extend(["", "## 结论填写建议", "", *suggestions])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -207,12 +244,17 @@ def main() -> None:
     report_dir = PROJECT_ROOT / "outputs" / "reports" / "ablation"
     output_path = PROJECT_ROOT / args.output if args.output else timestamped_path(report_dir, "ablation_report", ".md")
     plot_path = PROJECT_ROOT / args.plot if args.plot else output_path.with_name(output_path.stem.replace("ablation_report", "ablation_macro_f1") + ".png")
-    df = pd.read_csv(csv_path)
-    if df.empty:
+    raw_df = pd.read_csv(csv_path)
+    if raw_df.empty:
         raise ValueError(f"CSV 为空，无法生成报告: {csv_path}")
+    df = aggregate_results(raw_df)
+    aggregate_csv = output_path.with_name(output_path.stem + "_aggregated.csv")
+    aggregate_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(aggregate_csv, index=False, encoding="utf-8-sig")
     plot_macro_f1(df, plot_path)
     write_report(df, csv_path, output_path, plot_path)
     print(f"消融报告已保存: {output_path.resolve()}")
+    print(f"多种子聚合表已保存: {aggregate_csv.resolve()}")
     print(f"Macro F1 图已保存: {plot_path.resolve()}")
 
 

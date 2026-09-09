@@ -29,6 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from models.factory import load_model_from_checkpoint
 from models.resnet_transformer import ResNet50_Transformer
 from utils.report_paths import timestamped_path
 
@@ -78,25 +79,15 @@ def load_model(checkpoint_path: Path, num_classes: int, image_size: Optional[int
     输出:
         eval 模式的 ResNet50_Transformer。
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-    model = ResNet50_Transformer(
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    model = load_model_from_checkpoint(
+        checkpoint,
         num_classes=num_classes,
-        image_size=image_size or int(cfg.get("image_size", 512)),
-        transformer_dim=int(cfg.get("transformer_dim", 512)),
-        transformer_depth=int(cfg.get("transformer_depth", 2)),
-        transformer_heads=int(cfg.get("transformer_heads", 8)),
-        transformer_mlp_ratio=float(cfg.get("transformer_mlp_ratio", 4.0)),
-        pooling=str(cfg.get("transformer_pooling", "cls")),
-        dropout=float(cfg.get("dropout", 0.1)),
-        pretrained=False,
-        backbone_stage=str(cfg.get("backbone_stage", "layer3")),
-        token_pool_size=int(cfg.get("token_pool_size", 16)),
+        image_size=image_size,
+        device=device,
     )
-    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    model.load_state_dict(state_dict, strict=True)
-    model.to(device)
-    model.eval()
+    if not isinstance(model, ResNet50_Transformer):
+        raise TypeError("Attention Map 仅适用于 ResNet50-Transformer；其他模型请使用 Grad-CAM。")
     return model
 
 
@@ -157,7 +148,8 @@ def generate_attention(
         # CLS Token 对所有空间 token 的注意力，越高代表该区域对全局分类表征越重要。
         spatial_attention = attn[:, 0, -spatial_token_count:].mean(dim=0)
     else:
-        # Mean pooling 模型没有 CLS Token，退化为所有 query 对 source token 的平均关注。
+        # Mean pooling 模型没有 CLS Token。这里展示所有 query 对 source token 的
+        # 平均“被关注度”，它是 class-agnostic 诊断图，不能解释成目标类别因果证据。
         spatial_attention = attn[:, :, -spatial_token_count:].mean(dim=(0, 1))
 
     attention_map = spatial_attention.reshape(token_h, token_w).numpy()
@@ -233,6 +225,7 @@ def main() -> None:
         raise FileNotFoundError(f"找不到类别映射: {class_map_path}")
     if not image_path.exists():
         raise FileNotFoundError(f"找不到图片: {image_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -245,7 +238,13 @@ def main() -> None:
     attention_map, pred_index, confidence = generate_attention(model, input_tensor, device)
     overlay_rgb = overlay_attention(original_rgb, attention_map)
     species_name = idx_to_class[pred_index].replace("_", " ").title()
-    save_comparison(original_rgb, overlay_rgb, output_path, f"{species_name} {confidence * 100:.2f}%")
+    map_kind = "CLS attention" if model.pooling == "cls" else "mean-attention proxy (class-agnostic)"
+    save_comparison(
+        original_rgb,
+        overlay_rgb,
+        output_path,
+        f"{map_kind}; prediction {species_name} {confidence * 100:.2f}%",
+    )
     print(f"Attention Map 已保存: {output_path.resolve()}")
 
 

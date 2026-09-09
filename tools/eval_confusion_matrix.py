@@ -40,8 +40,7 @@ from data.dataset import (
     normalize_species_column,
     split_train_val,
 )
-from models.resnet_baseline import ResNet50Baseline
-from models.resnet_transformer import ResNet50_Transformer
+from models.factory import load_model_from_checkpoint
 from utils.report_paths import timestamped_path
 
 
@@ -60,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-csv", default="archive/train.csv", help="带 image/species 列的评估 CSV")
     parser.add_argument("--image-dir", default="archive/train_images", help="评估图片目录")
     parser.add_argument("--output", default=None, help="输出图片路径；为空时写入 outputs/reports/evaluation/ 并自动加时间戳")
-    parser.add_argument("--model-type", choices=("auto", "transformer", "baseline"), default="auto")
+    parser.add_argument("--model-type", choices=("auto", "transformer", "baseline", "metric"), default="auto")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--image-size", type=int, default=None, help="覆盖 checkpoint 中的 image_size")
@@ -105,39 +104,13 @@ def build_model(args: argparse.Namespace, checkpoint: dict, num_classes: int, de
     输出:
         eval 模式的 PyTorch 模型。
     """
-    cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-    image_size = args.image_size or int(cfg.get("image_size", 512))
-
-    model_type = args.model_type
-    if model_type == "auto":
-        model_type = str(cfg.get("model_type", "transformer"))
-
-    if model_type == "baseline":
-        model = ResNet50Baseline(
-            num_classes=num_classes,
-            pretrained=False,
-            dropout=float(cfg.get("dropout", 0.1)),
-        )
-    else:
-        model = ResNet50_Transformer(
-            num_classes=num_classes,
-            image_size=image_size,
-            transformer_dim=int(cfg.get("transformer_dim", 512)),
-            transformer_depth=int(cfg.get("transformer_depth", 2)),
-            transformer_heads=int(cfg.get("transformer_heads", 8)),
-            transformer_mlp_ratio=float(cfg.get("transformer_mlp_ratio", 4.0)),
-            pooling=str(cfg.get("transformer_pooling", "cls")),
-            dropout=float(cfg.get("dropout", 0.1)),
-            pretrained=False,
-            backbone_stage=str(cfg.get("backbone_stage", "layer3")),
-            token_pool_size=int(cfg.get("token_pool_size", 16)),
-        )
-
-    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    model.load_state_dict(state_dict, strict=True)
-    model.to(device)
-    model.eval()
-    return model
+    return load_model_from_checkpoint(
+        checkpoint,
+        num_classes=num_classes,
+        model_type=args.model_type,
+        image_size=args.image_size,
+        device=device,
+    )
 
 
 def compute_confusion_matrix(labels: List[int], preds: List[int], num_classes: int) -> np.ndarray:
@@ -254,6 +227,7 @@ def main() -> None:
         raise FileNotFoundError(f"找不到评估 CSV: {eval_csv_path}")
     if not image_dir.exists():
         raise FileNotFoundError(f"找不到图片目录: {image_dir}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device)

@@ -1,159 +1,124 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# Package reports/artifacts from an existing trained checkpoint.
-#
-# Default target is ablation experiment 04:
-#   outputs/ablations/04_transformer_mean_focal_mixup_cutout/
-#
-# Usage:
-#   bash scripts/autodl_package_existing_model.sh
-#
-# Override example:
-#   RUN_NAME=best_exp \
-#   CHECKPOINT=outputs/ablations/04_transformer_mean_focal_mixup_cutout/best_model.pth \
-#   CLASS_MAP=outputs/ablations/04_transformer_mean_focal_mixup_cutout/class_to_idx.json \
-#   METRICS=outputs/ablations/04_transformer_mean_focal_mixup_cutout/metrics.json \
-#   bash scripts/autodl_package_existing_model.sh
+# Generate reports/artifact for an existing checkpoint. If the checkpoint was
+# trained by the new pipeline, its frozen test split is used automatically.
+# Legacy checkpoints have no untouched test split and are explicitly labelled
+# non-independent instead of presenting a re-split validation score as a test.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${PROJECT_ROOT}"
-
 RUN_TS="$(date +%Y%m%d-%H%M%S)"
 
 DATA_ROOT="${DATA_ROOT:-archive}"
-RUN_NAME="${RUN_NAME:-ablation04_transformer_mean_focal_mixup_cutout}"
-CHECKPOINT="${CHECKPOINT:-outputs/ablations/04_transformer_mean_focal_mixup_cutout/best_model.pth}"
-CLASS_MAP="${CLASS_MAP:-outputs/ablations/04_transformer_mean_focal_mixup_cutout/class_to_idx.json}"
-METRICS="${METRICS:-outputs/ablations/04_transformer_mean_focal_mixup_cutout/metrics.json}"
+RUN_NAME="${RUN_NAME:-existing_model}"
+CHECKPOINT="${CHECKPOINT:-outputs/reports/final_model_04/best_model.pth}"
+CLASS_MAP="${CLASS_MAP:-$(dirname "${CHECKPOINT}")/class_to_idx.json}"
+METRICS="${METRICS:-$(dirname "${CHECKPOINT}")/metrics.json}"
+TRAIN_SPLIT="${TRAIN_SPLIT:-$(dirname "${CHECKPOINT}")/splits/train.csv}"
+EVAL_CSV="${EVAL_CSV:-$(dirname "${CHECKPOINT}")/splits/test.csv}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/package_${RUN_NAME}_${RUN_TS}}"
-REPORT_DIR="${REPORT_DIR:-outputs/reports/${RUN_NAME}_${RUN_TS}}"
-ARTIFACT_DIR="${ARTIFACT_DIR:-artifacts/${RUN_NAME}_${RUN_TS}}"
+INSTALL_DEPS="${INSTALL_DEPS:-1}"
+RUN_ROOT="${RUN_ROOT:-outputs/package_${RUN_NAME}_${RUN_TS}}"
+REPORT_DIR="${RUN_ROOT}/report"
+ARTIFACT_DIR="${RUN_ROOT}/artifact"
+FINAL_MODEL_DIR="${RUN_ROOT}/final_model"
+LOG_FILE="${RUN_ROOT}/package.log"
 
-mkdir -p logs "${OUTPUT_DIR}" "${REPORT_DIR}/analysis" "${REPORT_DIR}/evaluation" "${REPORT_DIR}/interpretability" "${ARTIFACT_DIR}"
-LOG_FILE="logs/package_${RUN_NAME}_${RUN_TS}.log"
-
+mkdir -p "${REPORT_DIR}" "${ARTIFACT_DIR}" "${FINAL_MODEL_DIR}" "${RUN_ROOT}/interpretability"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
-echo "Project root: ${PROJECT_ROOT}"
-echo "Run name: ${RUN_NAME}"
-echo "Checkpoint: ${CHECKPOINT}"
-echo "Class map: ${CLASS_MAP}"
-echo "Metrics: ${METRICS}"
-echo "Report dir: ${REPORT_DIR}"
-echo "Artifact dir: ${ARTIFACT_DIR}"
-echo "Log file: ${LOG_FILE}"
+for required in "${CHECKPOINT}" "${CLASS_MAP}" "${DATA_ROOT}/train.csv" "${DATA_ROOT}/train_images"; do
+  if [[ ! -e "${required}" ]]; then
+    echo "Required path missing: ${required}"
+    exit 1
+  fi
+done
 
-if [[ ! -f "${CHECKPOINT}" ]]; then
-  echo "Checkpoint not found: ${CHECKPOINT}"
-  exit 1
+if [[ "${INSTALL_DEPS}" == "1" ]]; then
+  python -m pip install -r requirements-autodl.txt
 fi
+cp "${CHECKPOINT}" "${FINAL_MODEL_DIR}/best_model.pth"
+cp "${CLASS_MAP}" "${FINAL_MODEL_DIR}/class_to_idx.json"
 
-if [[ ! -f "${CLASS_MAP}" ]]; then
-  echo "Class map not found: ${CLASS_MAP}"
-  exit 1
-fi
-
-echo "Verify Python environment..."
-python - <<'PY'
+if [[ -s "${EVAL_CSV}" ]]; then
+  SPLIT_NAME="independent_test"
+  INDEPENDENT_ARG="--independent-test"
+else
+  EVAL_CSV="${RUN_ROOT}/legacy_reconstructed_validation.csv"
+  TRAIN_SPLIT="${RUN_ROOT}/legacy_reconstructed_train.csv"
+  SPLIT_NAME="legacy_reconstructed_validation_non_independent"
+  INDEPENDENT_ARG=""
+  echo "WARNING: legacy checkpoint has no frozen untouched test CSV."
+  echo "Reconstructing its historical validation split. Scores must not be reported as test performance."
+  python - "${CHECKPOINT}" "${DATA_ROOT}/train.csv" "${TRAIN_SPLIT}" "${EVAL_CSV}" <<'PY'
+import sys
 import torch
-print("torch:", torch.__version__)
-print("cuda available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("gpu:", torch.cuda.get_device_name(0))
-    print("cuda:", torch.version.cuda)
+import pandas as pd
+from data.dataset import normalize_species_column, split_train_val
+
+checkpoint = torch.load(sys.argv[1], map_location="cpu")
+cfg = checkpoint.get("config", {})
+frame = normalize_species_column(pd.read_csv(sys.argv[2]), fix_typos=bool(cfg.get("fix_species_typos", True)))
+train, validation = split_train_val(
+    frame,
+    label_col="species",
+    val_ratio=float(cfg.get("val_ratio", 0.2)),
+    seed=int(cfg.get("split_seed", cfg.get("seed", 42))),
+    split_strategy=str(cfg.get("split_strategy", "group")),
+    group_col=str(cfg.get("group_col", "individual_id")),
+)
+train.to_csv(sys.argv[3], index=False, encoding="utf-8-sig")
+validation.to_csv(sys.argv[4], index=False, encoding="utf-8-sig")
 PY
-
-echo "Install/verify Python dependencies..."
-python -m pip install -r requirements.txt
-
-echo "Copy checkpoint-side files into package output..."
-cp "${CHECKPOINT}" "${OUTPUT_DIR}/best_model.pth"
-cp "${CLASS_MAP}" "${OUTPUT_DIR}/class_to_idx.json"
-if [[ -f "${METRICS}" ]]; then
-  cp "${METRICS}" "${OUTPUT_DIR}/metrics.json"
+fi
+if [[ ! -s "${TRAIN_SPLIT}" ]]; then
+  TRAIN_SPLIT="${DATA_ROOT}/train.csv"
 fi
 
-echo "Generate dataset and per-class analysis..."
-python tools/analyze_dataset.py \
-  --csv "${DATA_ROOT}/train.csv" \
-  --image-dir "${DATA_ROOT}/train_images" \
-  --output-dir "${REPORT_DIR}/analysis" \
+python tools/generate_model_report.py \
   --checkpoint "${CHECKPOINT}" \
   --class-map "${CLASS_MAP}" \
+  --eval-csv "${EVAL_CSV}" \
+  --train-csv "${TRAIN_SPLIT}" \
+  --image-dir "${DATA_ROOT}/train_images" \
+  --output-dir "${REPORT_DIR}" \
+  --split-name "${SPLIT_NAME}" \
+  ${INDEPENDENT_ARG} \
   --batch-size "${BATCH_SIZE}" \
   --num-workers "${NUM_WORKERS}" \
-  --split-strategy group \
-  --group-col individual_id
+  --bootstrap-iters 1000
 
-echo "Generate confusion matrix..."
-python tools/eval_confusion_matrix.py \
+SAMPLE_IMAGE="$(python -c 'import pandas as pd,sys; from pathlib import Path; d=pd.read_csv(sys.argv[1]); print(Path(sys.argv[2]) / str(d.iloc[0]["image"]))' "${REPORT_DIR}/predictions.csv" "${DATA_ROOT}/train_images")"
+python tools/generate_gradcam.py \
+  --image "${SAMPLE_IMAGE}" \
   --checkpoint "${CHECKPOINT}" \
   --class-map "${CLASS_MAP}" \
-  --eval-csv "${DATA_ROOT}/train.csv" \
-  --image-dir "${DATA_ROOT}/train_images" \
-  --output "${REPORT_DIR}/evaluation/confusion_matrix.png" \
-  --batch-size "${BATCH_SIZE}" \
-  --num-workers "${NUM_WORKERS}" \
-  --split-strategy group \
-  --group-col individual_id \
-  --normalize
+  --output "${RUN_ROOT}/interpretability/gradcam.jpg"
 
-SAMPLE_IMAGE="$(python - <<PY
-import pandas as pd
-from pathlib import Path
-csv_path = Path("${DATA_ROOT}") / "train.csv"
-image_dir = Path("${DATA_ROOT}") / "train_images"
-df = pd.read_csv(csv_path)
-for name in df["image"].astype(str):
-    path = image_dir / name
-    if path.exists():
-        print(path.as_posix())
-        break
-PY
-)"
-
-if [[ -n "${SAMPLE_IMAGE}" ]]; then
-  echo "Generate Grad-CAM for ${SAMPLE_IMAGE}..."
-  python tools/generate_gradcam.py \
-    --image "${SAMPLE_IMAGE}" \
-    --checkpoint "${CHECKPOINT}" \
-    --class-map "${CLASS_MAP}" \
-    --output "${REPORT_DIR}/interpretability/gradcam.jpg"
-
-  echo "Generate Transformer attention map for ${SAMPLE_IMAGE}..."
+MODEL_TYPE="$(python -c 'import torch,sys; c=torch.load(sys.argv[1], map_location="cpu"); print(c.get("config",{}).get("model_type","transformer"))' "${CHECKPOINT}")"
+if [[ "${MODEL_TYPE}" == "transformer" ]]; then
   python tools/generate_attention_map.py \
     --image "${SAMPLE_IMAGE}" \
     --checkpoint "${CHECKPOINT}" \
     --class-map "${CLASS_MAP}" \
-    --output "${REPORT_DIR}/interpretability/attention_map.jpg"
-else
-  echo "Warning: no sample image found, skip Grad-CAM and attention map."
+    --output "${RUN_ROOT}/interpretability/attention_map.jpg"
 fi
 
-echo "Export ONNX artifact..."
+EXPORT_ARGS=(
+  --checkpoint "${CHECKPOINT}"
+  --class-map "${CLASS_MAP}"
+  --artifact-dir "${ARTIFACT_DIR}"
+  --version "${RUN_TS}"
+)
 if [[ -f "${METRICS}" ]]; then
-  python tools/export_onnx.py \
-    --checkpoint "${CHECKPOINT}" \
-    --class-map "${CLASS_MAP}" \
-    --metrics "${METRICS}" \
-    --artifact-dir "${ARTIFACT_DIR}" \
-    --version "${RUN_TS}"
+  EXPORT_ARGS+=(--metrics "${METRICS}")
 else
-  python tools/export_onnx.py \
-    --checkpoint "${CHECKPOINT}" \
-    --class-map "${CLASS_MAP}" \
-    --artifact-dir "${ARTIFACT_DIR}" \
-    --version "${RUN_TS}"
+  EXPORT_ARGS+=(--metrics "${REPORT_DIR}/metrics.json")
 fi
+python tools/export_onnx.py "${EXPORT_ARGS[@]}"
 
-echo "Package outputs..."
-tar -czf "${RUN_NAME}_${RUN_TS}.tar.gz" "${OUTPUT_DIR}" "${REPORT_DIR}" "${ARTIFACT_DIR}" "${LOG_FILE}"
-
-echo "Done."
-echo "Package file: ${RUN_NAME}_${RUN_TS}.tar.gz"
-echo "Checkpoint copy: ${OUTPUT_DIR}/best_model.pth"
-echo "Reports: ${REPORT_DIR}"
-echo "Artifact: ${ARTIFACT_DIR}"
+PACKAGE_FILE="${RUN_NAME}_${RUN_TS}.tar.gz"
+tar -czf "${PACKAGE_FILE}" "${RUN_ROOT}"
+echo "Done. Download ${PACKAGE_FILE}"
