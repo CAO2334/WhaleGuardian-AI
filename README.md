@@ -9,7 +9,7 @@
 当前项目已包含：
 
 - ResNet50 baseline、ResNet50-Transformer 与 GeM/Sub-center ArcFace metric 模型
-- 当前单模型为 `07_previous_best_transformer_recipe`；研究端最佳为验证集锁定的四模型概率集成，独立测试 Accuracy `98.43%`、Macro F1 `92.60%`
+- 已完成 17 组同划分受控实验；当前单模型为 `07_previous_best_transformer_recipe`，最佳结果为验证集锁定的四模型概率集成，独立测试 Accuracy `98.43%`、Macro F1 `92.60%`
 - Focal Loss、Mixup、Cutout、EMA、Warmup + Cosine LR
 - Macro F1、混淆矩阵、长尾分布分析、消融实验框架
 - Group Split by `individual_id`，避免同一鲸鱼个体泄漏到训练集和验证集
@@ -279,7 +279,7 @@ RUN_ROOT=outputs/autodl_research_20260909-023128 \
 bash scripts/autodl_run_main_model.sh
 ```
 
-最终完整消融结果见 [reports/ablation_final_20260909-023128.md](reports/ablation_final_20260909-023128.md)。
+最终完整消融结果见 [reports/ablation_final_20260910.md](reports/ablation_final_20260910.md)。
 
 从当前版本开始，TensorBoard 日志会按实验名和时间戳自动分目录，例如：
 
@@ -326,6 +326,16 @@ python tools/run_ablation.py --run --suite controlled --epochs 3 --batch-size 4 
 | 05_metric_arcface_gem_crop | Linear → Sub-center ArcFace | 单独检验 ArcFace |
 | 06_transformer_mean_ce_crop | ResNet50 → Transformer mean | 检验全局关系建模 |
 | 07_previous_best_transformer_recipe | 历史 Focal/Mixup/Cutout 配方 | 与旧实验对接 |
+| 08_transformer_ce_mixup_cutout | Focal → CE | 单独检验 Focal |
+| 09_transformer_focal_nomixup_cutout | 关闭 Mixup | 单独检验 Mixup |
+| 10_transformer_focal_mixup_nocutout | 关闭 Cutout | 单独检验 Cutout |
+| 11_transformer_focal_mixup_cutout_crop | Resize → RandomResizedCrop | 检验裁剪尺度 |
+| 12_transformer_focal_mixup_cutout_token8 | Token Pool 16 → 8 | 检验 token 数量下界 |
+| 13_transformer_focal_mixup_cutout_token24 | Token Pool 16 → 24 | 检验 token 数量上界 |
+| 14_transformer_focal_mixup_cutout_layer3 | layer3+layer4 → layer3 | 检验多尺度融合 |
+| 15_transformer_focal_mixup_cutout_dropout02 | Dropout 0.1 → 0.2 | 检验正则强度 |
+| 16_transformer_focal_mixup_cutout_freeze2 | 前 2 epoch 冻结 backbone | 检验冻结策略 |
+| 17_transformer_focal_mixup_cutout_image384 | 输入 512 → 384 | 检验输入分辨率 |
 
 原 6 组实验仍可用 `--suite legacy` 复现。
 
@@ -416,16 +426,14 @@ Grad-CAM 用于观察 CNN 局部关注区域，Transformer Attention Map 用于�
 
 ## ONNX 导出与模型版本管理
 
-当前推荐的最佳单模型 artifact 为：
+当前推荐的默认 Flask artifact 为四模型集成；若集成目录不存在，服务自动回退到最佳单模型 07：
 
 ```text
+artifacts/final_ensemble_07
 artifacts/final_model_07
 ```
 
-Flask 启动时会优先加载该目录；如果目录不存在，会自动搜索项目根目录或
-`outputs/autodl_research_*/artifact` 中 `experiment_name` 为
-`07_previous_best_transformer_recipe` 的最新 artifact。也可以通过
-`WHALE_ARTIFACT_DIR` 显式指定路径。
+Flask 会先查找 `ensemble_manifest.json` 及四个独立 ONNX 组件；如果集成加载失败，再搜索 `artifacts/final_model_07` 或 AutoDL 运行目录中的 07 artifact。可分别通过 `WHALE_ENSEMBLE_ARTIFACT_DIR`、`WHALE_ARTIFACT_DIR` 和 `WHALE_USE_ENSEMBLE` 控制加载策略。
 
 如果需要重新导出或覆盖该 artifact，可执行：
 
@@ -501,7 +509,7 @@ http://127.0.0.1:5000/health
 默认加载：
 
 ```text
-artifacts/final_model_07（或自动发现的 AutoDL 07 artifact）
+artifacts/final_ensemble_07（不可用时回退到 final_model_07 或 AutoDL 07 artifact）
 ```
 
 切换模型版本：
@@ -553,24 +561,28 @@ docker run --rm -p 5000:5000 `
 
 受控实验统一使用 `individual_id` Group Split：训练集 40,277 张、验证集 5,409 张、独立测试集 5,347 张，三个集合之间个体重叠均为 0。训练和选模阶段不读取独立测试集。
 
+01–17 共 17 组预设消融已全部完成。新增 08–17 均以 07 为单变量基准；其中最好的 15 为验证 Accuracy 97.82%、Macro F1 93.81%，仍未超过 07 的 98.23% / 94.87%，因此最佳单模型不变。
+
 | 模型 | 验证 Accuracy | 验证 Macro F1 | 独立测试 Accuracy | 独立测试 Macro F1 |
 |---|---:|---:|---:|---:|
 | 07 单模型 | 98.23% | 94.87% | 97.51% | 90.99% |
 | 验证集锁定四模型概率集成 | **98.63%** | **96.36%** | **98.43%** | **92.60%** |
+| 08–17 最佳新增单模型 15（未选用） | 97.82% | 93.81% | — | — |
+| 新集成候选 02/04/07/14（未采纳） | 98.56% | 96.61% | 98.20% | 92.26% |
 
 集成候选为 02 ResNet50、04 ResNet50 + GeM、06 ResNet50-Transformer CE 和 07 最佳单模型。权重以验证 Macro F1 搜索，最终锁定为 `0.1 / 0.1 / 0.1 / 0.7`，水平翻转 TTA 未被选中。相对 07 单模型，独立测试错误数由 133 降至 84，Accuracy 提升 0.92 个百分点，Macro F1 提升 1.61 个百分点。
 
-集成用于研究结果；ONNX/Flask 部署仍使用 07 单模型，以控制模型体积和推理成本。旧划分上的历史最佳验证 Macro F1 为 91.99%，不能与当前独立测试结果直接比较。
+把十个新增 checkpoint 加入验证候选后，最多四模型的搜索选择 `02/04/07/14 = 0.1/0.1/0.6/0.2`，验证 Macro F1 增加 0.25 个百分点，但同条件独立测试 Macro F1 从 92.59% 降至 92.26%，错误数增加 11 张。该验证增益没有泛化，因此不更新部署权重，也不根据测试结果继续调参。
 
-完整消融表和实验边界见 [reports/ablation_final_20260909-023128.md](reports/ablation_final_20260909-023128.md)。
+Flask 默认优先加载原 02/04/06/07 四模型 ONNX 集成，缺失时回退到 07 单模型。旧划分上的历史最佳验证 Macro F1 为 91.99%，不能与当前独立测试结果直接比较。完整消融表、单变量结论和新增集成复核见 [reports/ablation_final_20260910.md](reports/ablation_final_20260910.md)。
 
 ## 技术特性
 
 - 针对鲸类细粒度分类设计 ResNet50-Transformer 混合架构。
 - 引入 Token Pooling，把 layer3 token 从 1024 降到 256，兼顾细节和显存。
 - 融合 layer3 局部纹理与 layer4 全局语义，多尺度建模更适合细粒度识别。
-- 通过完整消融实验发现 `mean pooling` 优于 `CLS Token + EMA`，最终模型选择由实验结果驱动而非预设假设。
-- 使用 Focal Loss、Mixup、Cutout、EMA 等训练策略应对长尾数据和复杂海况，并量化它们的真实收益。
+- 通过 17 组固定划分实验量化裁剪、GeM、ArcFace、多尺度融合、Focal、Mixup、Cutout、token 数量、Dropout、冻结策略和输入分辨率，最终模型选择由实验结果驱动。
+- 单变量结果支持 Focal、Mixup、Cutout、layer3+layer4、Token Pool 16、Dropout 0.1、直接微调和 512 输入这一组当前局部最优配置。
 - 使用 Macro F1 作为核心保存指标，避免 Accuracy 被高频类别主导。
 - 使用 Group Split by `individual_id` 防止同一鲸鱼个体泄漏到验证集。
 - 提供完整消融实验、长尾分析、混淆矩阵、Grad-CAM 和 Attention Map。
@@ -582,7 +594,7 @@ docker run --rm -p 5000:5000 `
 
 - 当前主要做 `species` 物种分类，还没有扩展到 `individual_id` 开集个体重识别；不能直接使用 Kaggle MAP@5 排名为本项目背书。
 - Kaggle test_images 没有物种真值，因此当前独立测试集来自带标签训练数据的冻结 group holdout，仍需额外的跨组织/地点/时间外部测试。
-- 当前受控消融只完成随机种子 42，不能作为论文级稳定性结论；后续可补充多种子均值与标准差。
+- 17 组受控消融均只完成随机种子 42，不能作为论文级稳定性结论；后续可补充多种子均值与标准差。
 - 低置信度阈值目前基于最大 softmax 概率，后续可以加入温度校准、能量分数或 OOD 检测。
 - Web 当前是本地推理服务，生产部署还可以加入 Gunicorn、请求日志、模型热更新和访问鉴权。
 - 未来可加入 YOLO 作为前置鲸体检测模块，再将裁剪区域送入分类模型。
